@@ -23,5 +23,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install platformio
 
+      - name: Create config from example
+        run: cp include/config.example.h include/config.h
+
       - name: Build PlatformIO Project
         run: pio run --environment main
