@@ -3,8 +3,9 @@
 // Config
 #define TIME_TO_SLEEP 10 // s
 #define BATTERY_AVERAGE_SAMPLES 16
-#define POWER_SENSING_PIN  4
-#define VOLTAGE_DIVIDER_RATIO 2.0f // 100k and 100k resistors
+#define POWER_SENSING_PIN 0 // A0
+#define MOISTURE_SENSING_PIN 1 // A1
+#define VOLTAGE_DIVIDER_RATIO ((300000.0 + 100000.0) / 300000.0)
 
 #define TEMP_SENSOR_ENDPOINT_NUMBER 10
 #define REPORT_TIMEOUT 1000 // ms
@@ -12,6 +13,8 @@
 RTC_DATA_ATTR int bootCount = 0;
 
 ZigbeeTempSensor zbTempSensor = ZigbeeTempSensor(TEMP_SENSOR_ENDPOINT_NUMBER);
+
+const float[] batteryDischargeCurve = {3102, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4057};
 
 uint8_t dataToSend = 0;
 bool resend = false;
@@ -38,8 +41,21 @@ void readTemperature() {
 }
 
 void readHumidity(){
-  int sensorValue = analogRead(A1);
+  int sensorValue = analogRead(MOISTURE_SENSING_PIN);
   humidity = (sensorValue / 4096.0) * 100.0;
+}
+
+float voltageToPercents(float voltage_mv){
+  if(voltage_mv <= batteryDischargeCurve[0])
+    return 0.0;
+  
+  for (size_t i = 1; i < sizeof(batteryDischargeCurve) / sizeof(batteryDischargeCurve[0]); i++) {
+    if (voltage_mv < batteryDischargeCurve[i]) {
+      return map(voltage_mv, batteryDischargeCurve[i - 1], batteryDischargeCurve[i], (i - 1) * 10.0, i * 10.0);
+    }
+  }
+
+  return 100.0;
 }
 
 void readSensorBatteryVoltage(){
@@ -47,8 +63,8 @@ void readSensorBatteryVoltage(){
   for (int i = 0; i < BATTERY_AVERAGE_SAMPLES; i++) {
     batteryVoltageSum += analogReadMilliVolts(POWER_SENSING_PIN);
   }
-  batteryVoltage = (batteryVoltageSum / static_cast<float>(BATTERY_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO / 1000.0;
-  batteryLevel = 100 - bootCount;
+  batteryVoltage = (batteryVoltageSum / static_cast<float>(BATTERY_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
+  batteryLevel = voltageToPercents(batteryVoltage);
 }
 
 /************************ Sending *****************************/
@@ -121,7 +137,7 @@ void setup() {
   zbTempSensor.addHumiditySensor(0, 100, 1, 0.0);
  
   // Battery
-  zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryLevel, batteryVoltage);
+  zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryLevel, batteryVoltage / 1000.0);
 
 
   Zigbee.onGlobalDefaultResponse(onGlobalResponse);
