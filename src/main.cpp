@@ -1,11 +1,13 @@
 #include "Zigbee.h"
 
+#include "secrets.h"
+
 // =============================================================================
 // Configuration
 // =============================================================================
 
 // Sleep & Timing
-static const uint32_t TIME_TO_SLEEP_MS       = 20 * 1000;
+static const uint32_t TIME_TO_SLEEP_MS       = 10 * 1000;
 static const uint32_t REPORT_TIMEOUT_MS      = 1000;
 static const uint32_t REPORT_RETRY_DELAY_MS  = 50;
 static const uint8_t  MAX_REPORT_RETRIES     = 3;
@@ -20,8 +22,8 @@ static const uint8_t BATTERY_AVERAGE_SAMPLES = 16;
 static const float   VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
 
 // Moisture Sensor Calibration (mV)
-static const float MOISTURE_WET_VOLTAGE      = 1040.0f;
-static const float MOISTURE_DRY_VOLTAGE      = 2080.0f;
+static const float MOISTURE_WET_VOLTAGE      = 3200.0f; // 1040.0f;
+static const float MOISTURE_DRY_VOLTAGE      = 0.0f; // 2080.0f;
 
 // Zigbee
 static const uint8_t ZIGBEE_ENDPOINT         = 10;
@@ -38,7 +40,6 @@ static constexpr size_t BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / s
 // =============================================================================
 
 RTC_DATA_ATTR int bootCount = 0;
-RTC_DATA_ATTR float lastCycleTimings[1] = {0.0f};
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -51,13 +52,14 @@ float   moistureVoltage    = 0.0f;  // mV
 float   batteryPercentage  = 0.0f;  // %
 float   batteryVoltage     = 0.0f;  // mV
 
+float lastCycleTimings[10];
 
 // =============================================================================
 // Callbacks
 // =============================================================================
 
 void onGlobalResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
-    Serial.printf("Global response - command: %d, status: %s, endpoint: %d, cluster: 0x%04x\r\n", command, esp_zb_zcl_status_to_name(status), endpoint, cluster);
+    log_i("Global response - command: %d, status: %s, endpoint: %d, cluster: 0x%04x\r\n", command, esp_zb_zcl_status_to_name(status), endpoint, cluster);
 
     if (command != ZB_CMD_REPORT_ATTRIBUTE || endpoint != ZIGBEE_ENDPOINT) {
         return;
@@ -87,7 +89,7 @@ void readHumidity() {
     moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
     moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
-    
+
     digitalWrite(MOISTURE_POWER_PIN, LOW);
     pinMode(MOISTURE_POWER_PIN, INPUT);
 }
@@ -152,7 +154,6 @@ void sendData() {
             tries++;
         }
 
-        Serial.print(".");
         delay(REPORT_RETRY_DELAY_MS);
     }
 
@@ -168,12 +169,12 @@ void initializeZigbee() {
     zbTempSensor.setManufacturerAndModel("Espressif", "WetOrDead");
 
     // Temperature sensor configuration
-    zbTempSensor.setMinMaxValue(10, 50);
+    zbTempSensor.setMinMaxValue(10.0f, 50.0f);
     zbTempSensor.setDefaultValue(10.0f);
-    zbTempSensor.setTolerance(1);
+    zbTempSensor.setTolerance(1.0f);
 
     // Humidity sensor configuration
-    zbTempSensor.addHumiditySensor(0, 100, 1, 0.0f);
+    zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
 
     // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
     zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
@@ -186,22 +187,19 @@ void initializeZigbee() {
     Zigbee.setTimeout(10000);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
-        Serial.println("Zigbee failed to start!");
-        Serial.println("Rebooting...");
+        log_e("Zigbee failed to start!");
+        log_e("Rebooting...");
         ESP.restart();
     }
 
-    Serial.println("Connecting to network");
     while (!Zigbee.connected()) {
-        Serial.print(".");
+        log_i("Waiting to network connection");
         delay(100);
     }
-    Serial.println();
-    Serial.println("Successfully connected to Zigbee network");
 }
 
 void enterDeepSleep() {
-    Serial.println("Going to sleep now");
+    log_i("Going to sleep now");
 
     long elapsedMs = millis();
     long sleepDurationMs = TIME_TO_SLEEP_MS - elapsedMs;
@@ -216,29 +214,43 @@ void enterDeepSleep() {
 
 void setup() {
     bootCount++;
+    // lastCycleTimings[0] = millis();
 
     Serial.begin(115200);
+    // lastCycleTimings[1] = millis();
 
     analogSetAttenuation(ADC_11db);
+    // lastCycleTimings[2] = millis();
 
     // Allow firmware upload on first boot
     if (bootCount == 1) {
         delay(10000);
     }
+    // lastCycleTimings[3] = millis();
 
     // Read all sensors
     readTemperature();
+    // lastCycleTimings[4] = millis();
+
     readHumidity();
+    // lastCycleTimings[5] = millis();
+
     readBatteryVoltage();
+    // lastCycleTimings[6] = millis();
 
     // Initialize and connect to Zigbee network
     initializeZigbee();
+    // lastCycleTimings[7] = millis();
 
     // Transmit sensor data
     sendData();
+    // lastCycleTimings[8] = millis();
 
-    Serial.printf("Last cycle timings: %.2f ms\n", lastCycleTimings[0]);
-    lastCycleTimings[0] = millis();
+    //Serial.printf("Last cycle timings: %.2f ms\n", millis());
+    //delay(2000);
+    //for (size_t i = 0; i < sizeof(lastCycleTimings) / sizeof(lastCycleTimings[0]); i++) {
+    //    Serial.printf("Timing %zu: %.2f ms\n", i, lastCycleTimings[i]);
+    //}
 
     // Enter deep sleep
     enterDeepSleep();

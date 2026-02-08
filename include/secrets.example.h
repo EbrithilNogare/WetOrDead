@@ -1,5 +1,5 @@
 #pragma once
 
 // ============================================================================
-// WetOrDead - Soil Moisture Sensor Configuration
+// WetOrDead - Soil Moisture Sensor Secrets
 // ============================================================================
