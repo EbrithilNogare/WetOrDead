@@ -5,26 +5,32 @@
 // =============================================================================
 
 // Sleep & Timing
-static constexpr uint32_t TIME_TO_SLEEP_MS       = 10 * 1000;
-static constexpr uint32_t REPORT_TIMEOUT_MS      = 1000;
-static constexpr uint32_t REPORT_RETRY_DELAY_MS  = 50;
-static constexpr uint8_t  MAX_REPORT_RETRIES     = 3;
+static const uint32_t TIME_TO_SLEEP_MS       = 20 * 1000;
+static const uint32_t REPORT_TIMEOUT_MS      = 1000;
+static const uint32_t REPORT_RETRY_DELAY_MS  = 50;
+static const uint8_t  MAX_REPORT_RETRIES     = 3;
 
 // Analog Pins
-static constexpr uint8_t POWER_SENSING_PIN    = 0;  // A0
-static constexpr uint8_t MOISTURE_SENSING_PIN = 1;  // A1
+static const uint8_t POWER_SENSING_PIN       = 0;  // A0
+static const uint8_t MOISTURE_SENSING_PIN    = 1;  // A1
+static const uint8_t MOISTURE_POWER_PIN      = 2;  // D2
 
 // Battery Measurement
-static constexpr uint8_t BATTERY_AVERAGE_SAMPLES = 16;
-static constexpr float   VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
+static const uint8_t BATTERY_AVERAGE_SAMPLES = 16;
+static const float   VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
+
+// Moisture Sensor Calibration (mV)
+static const float MOISTURE_WET_VOLTAGE      = 1040.0f;
+static const float MOISTURE_DRY_VOLTAGE      = 2080.0f;
 
 // Zigbee
-static constexpr uint8_t ZIGBEE_ENDPOINT = 10;
+static const uint8_t ZIGBEE_ENDPOINT         = 10;
 
 // Battery discharge curve (voltage in mV for 0%, ..., 100%)
 static const float BATTERY_DISCHARGE_CURVE[] = {
     3102, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4057
 };
+
 static constexpr size_t BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / sizeof(BATTERY_DISCHARGE_CURVE[0]);
 
 // =============================================================================
@@ -32,15 +38,19 @@ static constexpr size_t BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / s
 // =============================================================================
 
 RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR float lastCycleTimings[1] = {0.0f};
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
-static uint8_t dataToSend     = 0;
-static bool    resend         = false;
-static float   temperature    = 0.0f;  // °C
-static float   humidity       = 0.0f;  // %
-static float   batteryLevel   = 0.0f;  // %
-static float   batteryVoltage = 0.0f;  // mV
+uint8_t dataToSend         = 0;
+bool    resend             = false;
+
+float   temperature        = 0.0f;  // °C
+float   moisturePercentage = 0.0f;  // %
+float   moistureVoltage    = 0.0f;  // mV
+float   batteryPercentage  = 0.0f;  // %
+float   batteryVoltage     = 0.0f;  // mV
+
 
 // =============================================================================
 // Callbacks
@@ -69,8 +79,17 @@ void readTemperature() {
 }
 
 void readHumidity() {
-    int sensorValue = analogRead(MOISTURE_SENSING_PIN);
-    humidity = (sensorValue / 4096.0f) * 100.0f;
+    pinMode(MOISTURE_POWER_PIN, OUTPUT);
+    digitalWrite(MOISTURE_POWER_PIN, HIGH);
+
+    delay(100);  // Allow sensor to stabilize
+
+    moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
+    moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
+    moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
+    
+    digitalWrite(MOISTURE_POWER_PIN, LOW);
+    pinMode(MOISTURE_POWER_PIN, INPUT);
 }
 
 float voltageToPercent(float voltageMv) {
@@ -99,7 +118,7 @@ void readBatteryVoltage() {
     }
 
     batteryVoltage = (voltageSum / static_cast<float>(BATTERY_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
-    batteryLevel = voltageToPercent(batteryVoltage);
+    batteryPercentage = voltageToPercent(batteryVoltage);
 }
 
 // =============================================================================
@@ -110,7 +129,7 @@ void sendData() {
     static constexpr uint8_t DATA_PIECES = 2;  // Temperature + Humidity
 
     zbTempSensor.setTemperature(temperature);
-    zbTempSensor.setHumidity(humidity);
+    zbTempSensor.setHumidity(moisturePercentage);
 
     dataToSend = DATA_PIECES;
     zbTempSensor.report();
@@ -156,8 +175,8 @@ void initializeZigbee() {
     // Humidity sensor configuration
     zbTempSensor.addHumiditySensor(0, 100, 1, 0.0f);
 
-    // Power source configuration
-    zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryLevel, batteryVoltage / 1000.0f);
+    // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
+    zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
 
     Zigbee.onGlobalDefaultResponse(onGlobalResponse);
     Zigbee.addEndpoint(&zbTempSensor);
@@ -184,29 +203,28 @@ void initializeZigbee() {
 void enterDeepSleep() {
     Serial.println("Going to sleep now");
 
-    int64_t elapsedMs = static_cast<int64_t>(millis());
-    int64_t sleepDurationMs = max(TIME_TO_SLEEP_MS - elapsedMs, 1000LL);
+    long elapsedMs = millis();
+    long sleepDurationMs = TIME_TO_SLEEP_MS - elapsedMs;
+    
+    if(sleepDurationMs < 1000L) {
+        sleepDurationMs = 1000L;
+    }
 
-    esp_sleep_enable_timer_wakeup(sleepDurationMs * 1000LL);
+    esp_sleep_enable_timer_wakeup(sleepDurationMs * 1000L);
     esp_deep_sleep_start();
 }
 
 void setup() {
     bootCount++;
+
     Serial.begin(115200);
-    delay(100);
+
+    analogSetAttenuation(ADC_11db);
 
     // Allow firmware upload on first boot
     if (bootCount == 1) {
-        Serial.println("First boot, waiting 10s for possible firmware upload...");
-        delay(9000);
+        delay(10000);
     }
-
-    // Visual indicator
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(1000);
-    digitalWrite(LED_BUILTIN, LOW);
 
     // Read all sensors
     readTemperature();
@@ -218,6 +236,9 @@ void setup() {
 
     // Transmit sensor data
     sendData();
+
+    Serial.printf("Last cycle timings: %.2f ms\n", lastCycleTimings[0]);
+    lastCycleTimings[0] = millis();
 
     // Enter deep sleep
     enterDeepSleep();
