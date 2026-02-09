@@ -84,7 +84,8 @@ void readHumidity() {
     pinMode(MOISTURE_POWER_PIN, OUTPUT);
     digitalWrite(MOISTURE_POWER_PIN, HIGH);
 
-    delay(100);  // Allow sensor to stabilize
+    esp_sleep_enable_timer_wakeup(100 * 1000);  // 100ms
+    esp_light_sleep_start();
 
     moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
