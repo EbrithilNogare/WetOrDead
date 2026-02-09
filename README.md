@@ -12,3 +12,4 @@
 |       sendData       | 782 | 353 | 1351 |
 
 sample size = 5
+time is in ms
