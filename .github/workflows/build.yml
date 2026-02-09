@@ -24,7 +24,7 @@ jobs:
           pip install platformio
 
       - name: Create config from example
-        run: cp include/config.example.h include/config.h
+        run: cp include/secrets.example.h include/secrets.h
 
       - name: Build PlatformIO Project
         run: pio run --environment main
