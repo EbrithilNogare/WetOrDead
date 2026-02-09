@@ -11,5 +11,5 @@
 |  initializeZigbee()  | 319 | 316 |  323 |
 |       sendData       | 782 | 353 | 1351 |
 
-sample size = 5
-time is in ms
+- sample size = 5
+- time is in ms
