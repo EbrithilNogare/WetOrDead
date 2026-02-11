@@ -7,7 +7,7 @@
 // =============================================================================
 
 // Sleep & Timing
-static const uint32_t TIME_TO_SLEEP_MS       = 10 * 1000;
+static const uint32_t TIME_TO_SLEEP_MS       = 5 * 120 * 1000;
 static const uint32_t REPORT_TIMEOUT_MS      = 1000;
 static const uint32_t REPORT_RETRY_DELAY_MS  = 50;
 static const uint8_t  MAX_REPORT_RETRIES     = 3;
