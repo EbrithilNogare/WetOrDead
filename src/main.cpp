@@ -11,6 +11,7 @@ static const uint32_t TIME_TO_SLEEP_MS       = 5 * 120 * 1000;
 static const uint32_t REPORT_TIMEOUT_MS      = 1000;
 static const uint32_t REPORT_RETRY_DELAY_MS  = 50;
 static const uint8_t  MAX_REPORT_RETRIES     = 3;
+static const uint32_t ZIGBEE_CONNECT_TIMEOUT_MS = 2000;
 
 // Analog Pins
 static const uint8_t POWER_SENSING_PIN       = 0;  // A0
@@ -166,6 +167,20 @@ void sendData() {
 // Setup & Main Loop
 // =============================================================================
 
+void enterDeepSleep() {
+    log_i("Going to sleep now");
+
+    long elapsedMs = millis();
+    long sleepDurationMs = TIME_TO_SLEEP_MS - elapsedMs;
+    
+    if(sleepDurationMs < 1000L) {
+        sleepDurationMs = 1000L;
+    }
+
+    esp_sleep_enable_timer_wakeup(sleepDurationMs * 1000L);
+    esp_deep_sleep_start();
+}
+
 void initializeZigbee() {
     zbTempSensor.setManufacturerAndModel("Espressif", "WetOrDead");
 
@@ -193,24 +208,15 @@ void initializeZigbee() {
         ESP.restart();
     }
 
+    unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
-        log_i("Waiting to network connection");
-        delay(100);
+        if (millis() - connectStart >= ZIGBEE_CONNECT_TIMEOUT_MS) {
+            log_w("Zigbee connection timed out after %lu ms, going to sleep", ZIGBEE_CONNECT_TIMEOUT_MS);
+            enterDeepSleep();
+        }
+        log_i("Waiting for network connection");
+        delay(50);
     }
-}
-
-void enterDeepSleep() {
-    log_i("Going to sleep now");
-
-    long elapsedMs = millis();
-    long sleepDurationMs = TIME_TO_SLEEP_MS - elapsedMs;
-    
-    if(sleepDurationMs < 1000L) {
-        sleepDurationMs = 1000L;
-    }
-
-    esp_sleep_enable_timer_wakeup(sleepDurationMs * 1000L);
-    esp_deep_sleep_start();
 }
 
 void setup() {
