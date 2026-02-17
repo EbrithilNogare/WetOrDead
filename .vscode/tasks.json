@@ -14,12 +14,12 @@
       "type": "pickString",
       "description": "Select the environment to build and upload",
       "default": "main",
-      "options": ["main", "test"]
+      "options": ["main", "ZigbeeMicro"]
     }
   ],
   "tasks": [
     {
-      "label": "PlatformIO: Upload and run test",
+      "label": "PlatformIO: Upload and monitor",
       "type": "shell",
       "command": "python",
       "args": [
@@ -37,7 +37,6 @@
         "kind": "build",
         "isDefault": true
       },
-      "problemMatcher": ["$platformio"],
       "isBackground": false
     }
   ]

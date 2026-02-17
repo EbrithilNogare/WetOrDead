@@ -7,11 +7,12 @@
 // =============================================================================
 
 // Sleep & Timing
-static const uint32_t TIME_TO_SLEEP_MS       = 5 * 120 * 1000;
-static const uint32_t REPORT_TIMEOUT_MS      = 1000;
-static const uint32_t REPORT_RETRY_DELAY_MS  = 50;
-static const uint8_t  MAX_REPORT_RETRIES     = 3;
+static const uint32_t TIME_TO_SLEEP_MS          = 5 * 60 * 1000;
+static const uint32_t REPORT_TIMEOUT_MS         = 300;
+static const uint32_t REPORT_RETRY_DELAY_MS     = 20;
+static const uint8_t  MAX_REPORT_RETRIES        = 3;
 static const uint32_t ZIGBEE_CONNECT_TIMEOUT_MS = 2000;
+static const uint32_t ZIGBEE_PAIRING_TIMEOUT_MS = 30000;
 
 // Analog Pins
 static const uint8_t POWER_SENSING_PIN       = 0;  // A0
@@ -81,13 +82,12 @@ void readTemperature() {
     temperature = temperatureRead();
 }
 
-void readHumidity() {
+void moistureSensorPowerOn() {
     pinMode(MOISTURE_POWER_PIN, OUTPUT);
     digitalWrite(MOISTURE_POWER_PIN, HIGH);
+}
 
-    esp_sleep_enable_timer_wakeup(100 * 1000);  // 100ms
-    esp_light_sleep_start();
-
+void readMoistureAdc() {
     moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
     moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
@@ -130,37 +130,37 @@ void readBatteryVoltage() {
 // =============================================================================
 
 void sendData() {
-    static constexpr uint8_t DATA_PIECES = 2;  // Temperature + Humidity
+    static constexpr uint8_t DATA_PIECES = 2;
 
     zbTempSensor.setTemperature(temperature);
     zbTempSensor.setHumidity(moisturePercentage);
 
     dataToSend = DATA_PIECES;
     zbTempSensor.report();
+    zbTempSensor.reportBatteryPercentage();
 
-    // Wait for successful transmission with retry logic
+    // Wait for at least ONE successful response
     unsigned long startTime = millis();
     uint8_t tries = 0;
 
-    while (dataToSend != 0 && tries < MAX_REPORT_RETRIES) {
+    while (dataToSend == DATA_PIECES && tries < MAX_REPORT_RETRIES) {
         if (resend) {
             resend = false;
             dataToSend = DATA_PIECES;
             zbTempSensor.report();
+            zbTempSensor.reportBatteryPercentage();
         }
 
         if (millis() - startTime >= REPORT_TIMEOUT_MS) {
             dataToSend = DATA_PIECES;
             zbTempSensor.report();
+            zbTempSensor.reportBatteryPercentage();
             startTime = millis();
             tries++;
         }
 
         delay(REPORT_RETRY_DELAY_MS);
     }
-
-    zbTempSensor.reportBatteryPercentage();
-    delay(REPORT_RETRY_DELAY_MS);
 }
 
 // =============================================================================
@@ -192,6 +192,8 @@ void initializeZigbee() {
     // Humidity sensor configuration
     zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
 
+    // batteryPercentage = bootCount % 100; // TODO remove this debug code
+
     // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
     zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
 
@@ -199,8 +201,9 @@ void initializeZigbee() {
     Zigbee.addEndpoint(&zbTempSensor);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
-    Zigbee.setTimeout(10000);
+    uint32_t connectTimeout = bootCount == 1 ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
+    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = connectTimeout;
+    Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
         log_e("Zigbee failed to start!");
@@ -210,56 +213,53 @@ void initializeZigbee() {
 
     unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
-        if (millis() - connectStart >= ZIGBEE_CONNECT_TIMEOUT_MS) {
-            log_w("Zigbee connection timed out after %lu ms, going to sleep", ZIGBEE_CONNECT_TIMEOUT_MS);
+        if (millis() - connectStart >= connectTimeout) {
+            log_w("Zigbee connection timed out after %lu ms, going to sleep", connectTimeout);
             enterDeepSleep();
         }
         log_i("Waiting for network connection");
-        delay(50);
+        delay(10);
     }
+}
+
+void setupAntenna() {
+    analogSetAttenuation(ADC_11db);
+
+    // Switch RF to external antenna (XIAO ESP32C6 FM8625H RF switch)
+    pinMode(3, OUTPUT);
+    digitalWrite(3, LOW);     // Power on the RF switch
+    pinMode(14, OUTPUT);
+    digitalWrite(14, HIGH);   // Select external antenna
 }
 
 void setup() {
     bootCount++;
-    // lastCycleTimings[0] = millis();
+
+    //lastCycleTimings[0] = millis();
 
     Serial.begin(115200);
-    // lastCycleTimings[1] = millis();
-
-    analogSetAttenuation(ADC_11db);
-    // lastCycleTimings[2] = millis();
 
     // Allow firmware upload on first boot
     if (bootCount == 1) {
         delay(10000);
     }
-    // lastCycleTimings[3] = millis();
 
-    // Read all sensors
+    setupAntenna();
     readTemperature();
-    // lastCycleTimings[4] = millis();
-
-    readHumidity();
-    // lastCycleTimings[5] = millis();
-
     readBatteryVoltage();
-    // lastCycleTimings[6] = millis();
-
-    // Initialize and connect to Zigbee network
+    moistureSensorPowerOn();
     initializeZigbee();
-    // lastCycleTimings[7] = millis();
-
-    // Transmit sensor data
+    readMoistureAdc();
+    //lastCycleTimings[8] = millis();
     sendData();
-    // lastCycleTimings[8] = millis();
+    //lastCycleTimings[9] = millis();
 
-    //Serial.printf("Last cycle timings: %.2f ms\n", millis());
-    //delay(2000);
-    //for (size_t i = 0; i < sizeof(lastCycleTimings) / sizeof(lastCycleTimings[0]); i++) {
-    //    Serial.printf("Timing %zu: %.2f ms\n", i, lastCycleTimings[i]);
-    //}
+    // delay(4000);
+    // Serial.printf("%.0f, %.0f, %.0f\n", lastCycleTimings[8] - lastCycleTimings[0], lastCycleTimings[9] - lastCycleTimings[8], lastCycleTimings[9] - lastCycleTimings[0]);
+    // delay(2000);
+    // Serial.flush();
+    // delay(1000);
 
-    // Enter deep sleep
     enterDeepSleep();
 }
 
