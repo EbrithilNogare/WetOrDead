@@ -146,7 +146,7 @@ void readBatteryVoltage() {
 // Data Transmission
 // =============================================================================
 
-void sendData() {
+bool sendData() {
     static constexpr uint8_t DATA_PIECES = 2;
 
     zbTempSensor.setTemperature(temperature);
@@ -156,11 +156,10 @@ void sendData() {
     zbTempSensor.report();
     zbTempSensor.reportBatteryPercentage();
 
-    // Wait for at least ONE successful response
     unsigned long startTime = millis();
     uint8_t tries = 0;
 
-    while (dataToSend == DATA_PIECES && tries < MAX_REPORT_RETRIES) {
+    while (dataToSend > 0 && tries < MAX_REPORT_RETRIES) {
         if (resend) {
             resend = false;
             dataToSend = DATA_PIECES;
@@ -178,6 +177,8 @@ void sendData() {
 
         delay(REPORT_RETRY_DELAY_MS);
     }
+
+    return dataToSend == 0;
 }
 
 // =============================================================================
@@ -235,12 +236,12 @@ void initializeZigbee() {
             enterDeepSleep();
         }
         log_i("Waiting for network connection");
-        delay(10);
+        delay(20);
     }
 }
 
 void setupAntenna() {
-    analogSetAttenuation(ADC_11db);
+    esp_zb_set_tx_power(20); // dBm
 
     // Switch RF to external antenna (XIAO ESP32C6 FM8625H RF switch)
     pinMode(3, OUTPUT);
@@ -251,6 +252,7 @@ void setupAntenna() {
 
 void setup() {
     bootCount++;
+    smallCycleCount++;
 
     Serial.begin(115200);
 
@@ -258,7 +260,8 @@ void setup() {
     if (bootCount == 1) {
         delay(10000);
     }
-
+    
+    analogSetAttenuation(ADC_11db);
     setupAntenna();
 
     moistureSensorPowerOn();
@@ -267,18 +270,17 @@ void setup() {
 
     if (!shouldSendData()) {
         // Small change -> go back to sleep
-        previousMoistureValue = moisturePercentage;
-        smallCycleCount++;
         enterDeepSleep();
     }
+    smallCycleCount = 0;
 
     readTemperature();
     readBatteryVoltage();
     initializeZigbee();
-    sendData();
 
-    previousMoistureValue = moisturePercentage;
-    smallCycleCount = 0;
+    if (sendData()) {
+        previousMoistureValue = moisturePercentage;
+    }
 
     enterDeepSleep();
 }
