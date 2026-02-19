@@ -7,12 +7,17 @@
 // =============================================================================
 
 // Sleep & Timing
-static const uint32_t TIME_TO_SLEEP_MS          = 5 * 60 * 1000;
+static const uint32_t TIME_TO_SLEEP_MS          = 1 * 60 * 1000;
+static const uint32_t SENSOR_WARMUP_MS          = 100;  // 100ms light sleep for sensor
 static const uint32_t REPORT_TIMEOUT_MS         = 300;
 static const uint32_t REPORT_RETRY_DELAY_MS     = 20;
 static const uint8_t  MAX_REPORT_RETRIES        = 3;
 static const uint32_t ZIGBEE_CONNECT_TIMEOUT_MS = 2000;
 static const uint32_t ZIGBEE_PAIRING_TIMEOUT_MS = 30000;
+
+// Change detection
+static const float    MOISTURE_CHANGE_THRESHOLD = 5.0f;  // % change to trigger send
+static const uint8_t  FULL_UPDATE_INTERVAL      = 5;     // force send after N small cycles
 
 // Analog Pins
 static const uint8_t POWER_SENSING_PIN       = 0;  // A0
@@ -32,7 +37,7 @@ static const uint8_t ZIGBEE_ENDPOINT         = 10;
 
 // Battery discharge curve (voltage in mV for 0%, ..., 100%)
 static const float BATTERY_DISCHARGE_CURVE[] = {
-    3102, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4057
+    3100, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100
 };
 
 static constexpr size_t BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / sizeof(BATTERY_DISCHARGE_CURVE[0]);
@@ -41,7 +46,9 @@ static constexpr size_t BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / s
 // Global State
 // =============================================================================
 
-RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR long    bootCount                = 0;
+RTC_DATA_ATTR float   previousMoistureValue    = -100.0f;
+RTC_DATA_ATTR uint8_t smallCycleCount          = 0;        // cycles since last full update
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -53,8 +60,6 @@ float   moisturePercentage = 0.0f;  // %
 float   moistureVoltage    = 0.0f;  // mV
 float   batteryPercentage  = 0.0f;  // %
 float   batteryVoltage     = 0.0f;  // mV
-
-float lastCycleTimings[10];
 
 // =============================================================================
 // Callbacks
@@ -87,6 +92,11 @@ void moistureSensorPowerOn() {
     digitalWrite(MOISTURE_POWER_PIN, HIGH);
 }
 
+void lightSleepForSensor() {
+    esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
+    esp_light_sleep_start();
+}
+
 void readMoistureAdc() {
     moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
@@ -94,6 +104,13 @@ void readMoistureAdc() {
 
     digitalWrite(MOISTURE_POWER_PIN, LOW);
     pinMode(MOISTURE_POWER_PIN, INPUT);
+}
+
+bool shouldSendData() {
+    if (smallCycleCount >= FULL_UPDATE_INTERVAL)
+        return true;
+
+    return fabs(moisturePercentage - previousMoistureValue) >= MOISTURE_CHANGE_THRESHOLD;
 }
 
 float voltageToPercent(float voltageMv) {
@@ -206,9 +223,9 @@ void initializeZigbee() {
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
-        log_e("Zigbee failed to start!");
-        log_e("Rebooting...");
-        ESP.restart();
+        log_e("Zigbee failed to start, going to sleep");
+        smallCycleCount++;
+        enterDeepSleep();
     }
 
     unsigned long connectStart = millis();
@@ -235,8 +252,6 @@ void setupAntenna() {
 void setup() {
     bootCount++;
 
-    //lastCycleTimings[0] = millis();
-
     Serial.begin(115200);
 
     // Allow firmware upload on first boot
@@ -245,20 +260,25 @@ void setup() {
     }
 
     setupAntenna();
+
+    moistureSensorPowerOn();
+    lightSleepForSensor();
+    readMoistureAdc();
+
+    if (!shouldSendData()) {
+        // Small change -> go back to sleep
+        previousMoistureValue = moisturePercentage;
+        smallCycleCount++;
+        enterDeepSleep();
+    }
+
     readTemperature();
     readBatteryVoltage();
-    moistureSensorPowerOn();
     initializeZigbee();
-    readMoistureAdc();
-    //lastCycleTimings[8] = millis();
     sendData();
-    //lastCycleTimings[9] = millis();
 
-    // delay(4000);
-    // Serial.printf("%.0f, %.0f, %.0f\n", lastCycleTimings[8] - lastCycleTimings[0], lastCycleTimings[9] - lastCycleTimings[8], lastCycleTimings[9] - lastCycleTimings[0]);
-    // delay(2000);
-    // Serial.flush();
-    // delay(1000);
+    previousMoistureValue = moisturePercentage;
+    smallCycleCount = 0;
 
     enterDeepSleep();
 }
