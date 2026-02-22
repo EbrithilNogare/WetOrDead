@@ -6,3 +6,4 @@
 
 # Sensitive configuration
 include/secrets.h
+compile_commands.json

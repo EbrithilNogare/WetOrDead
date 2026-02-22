@@ -7,77 +7,54 @@
 // =============================================================================
 
 // Sleep & Timing
-static const uint32_t TIME_TO_SLEEP_MS          = 1 * 60 * 1000;
-static const uint32_t SENSOR_WARMUP_MS          = 100;  // 100ms light sleep for sensor
-static const uint32_t REPORT_TIMEOUT_MS         = 300;
-static const uint32_t REPORT_RETRY_DELAY_MS     = 20;
-static const uint8_t  MAX_REPORT_RETRIES        = 3;
-static const uint32_t ZIGBEE_CONNECT_TIMEOUT_MS = 2000;
-static const uint32_t ZIGBEE_PAIRING_TIMEOUT_MS = 30000;
+static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
+static const int SENSOR_WARMUP_MS          = 100;           // ms
+static const int REPORT_SEND_DELAY_MS      = 100;           // ms
+static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
+static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
 
 // Change detection
-static const float    MOISTURE_CHANGE_THRESHOLD = 5.0f;  // % change to trigger send
-static const uint8_t  FULL_UPDATE_INTERVAL      = 5;     // force send after N small cycles
+static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
+static const int   FULL_UPDATE_INTERVAL      = 5;    // force send every N small cycles
 
 // Analog Pins
-static const uint8_t POWER_SENSING_PIN       = 0;  // A0
-static const uint8_t MOISTURE_SENSING_PIN    = 1;  // A1
-static const uint8_t MOISTURE_POWER_PIN      = 2;  // D2
+static const int POWER_SENSING_PIN    = 0; // A0
+static const int MOISTURE_SENSING_PIN = 1; // A1
+static const int MOISTURE_POWER_PIN   = 2; // D2
 
 // Battery Measurement
-static const uint8_t BATTERY_AVERAGE_SAMPLES = 16;
-static const float   VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
+static const int   BATTERY_AVERAGE_SAMPLES = 16;
+static const float VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
 
 // Moisture Sensor Calibration (mV)
-static const float MOISTURE_WET_VOLTAGE      = 3200.0f; // 1040.0f;
-static const float MOISTURE_DRY_VOLTAGE      = 0.0f; // 2080.0f;
+static const float MOISTURE_WET_VOLTAGE = 3200.0f; // 1040.0f;
+static const float MOISTURE_DRY_VOLTAGE = 0.0f;    // 2080.0f;
 
 // Zigbee
-static const uint8_t ZIGBEE_ENDPOINT         = 10;
+static const int ZIGBEE_ENDPOINT = 10;
 
 // Battery discharge curve (voltage in mV for 0%, ..., 100%)
 static const float BATTERY_DISCHARGE_CURVE[] = {
     3100, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100
 };
 
-static constexpr size_t BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / sizeof(BATTERY_DISCHARGE_CURVE[0]);
+static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / sizeof(BATTERY_DISCHARGE_CURVE[0]);
 
 // =============================================================================
 // Global State
 // =============================================================================
 
-RTC_DATA_ATTR long    bootCount                = 0;
-RTC_DATA_ATTR float   previousMoistureValue    = -100.0f;
-RTC_DATA_ATTR uint8_t smallCycleCount          = 0;        // cycles since last full update
+RTC_DATA_ATTR long  bootCount             = 0;
+RTC_DATA_ATTR float previousMoistureValue = -100.0f;
+RTC_DATA_ATTR int   smallCycleCount       = 0;        // cycles since last full update
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
-uint8_t dataToSend         = 0;
-bool    resend             = false;
-
-float   temperature        = 0.0f;  // °C
-float   moisturePercentage = 0.0f;  // %
-float   moistureVoltage    = 0.0f;  // mV
-float   batteryPercentage  = 0.0f;  // %
-float   batteryVoltage     = 0.0f;  // mV
-
-// =============================================================================
-// Callbacks
-// =============================================================================
-
-void onGlobalResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
-    log_i("Global response - command: %d, status: %s, endpoint: %d, cluster: 0x%04x\r\n", command, esp_zb_zcl_status_to_name(status), endpoint, cluster);
-
-    if (command != ZB_CMD_REPORT_ATTRIBUTE || endpoint != ZIGBEE_ENDPOINT) {
-        return;
-    }
-
-    switch (status) {
-        case ESP_ZB_ZCL_STATUS_SUCCESS: dataToSend--;  break;
-        case ESP_ZB_ZCL_STATUS_FAIL:    resend = true; break;
-        default:                                       break;
-    }
-}
+float temperature        = 0.0f; // °C
+float moisturePercentage = 0.0f; // %
+float moistureVoltage    = 0.0f; // mV
+float batteryPercentage  = 0.0f; // %
+float batteryVoltage     = 0.0f; // mV
 
 // =============================================================================
 // Sensor Reading
@@ -146,39 +123,16 @@ void readBatteryVoltage() {
 // Data Transmission
 // =============================================================================
 
-bool sendData() {
-    static constexpr uint8_t DATA_PIECES = 2;
-
+void sendData() {
     zbTempSensor.setTemperature(temperature);
-    zbTempSensor.setHumidity(moisturePercentage);
+    zbTempSensor.setHumidity(moisturePercentage * 100.0f);
+    zbTempSensor.setBatteryPercentage(batteryPercentage);
+    zbTempSensor.setBatteryVoltage(batteryVoltage / 100.0f);
 
-    dataToSend = DATA_PIECES;
     zbTempSensor.report();
     zbTempSensor.reportBatteryPercentage();
 
-    unsigned long startTime = millis();
-    uint8_t tries = 0;
-
-    while (dataToSend > 0 && tries < MAX_REPORT_RETRIES) {
-        if (resend) {
-            resend = false;
-            dataToSend = DATA_PIECES;
-            zbTempSensor.report();
-            zbTempSensor.reportBatteryPercentage();
-        }
-
-        if (millis() - startTime >= REPORT_TIMEOUT_MS) {
-            dataToSend = DATA_PIECES;
-            zbTempSensor.report();
-            zbTempSensor.reportBatteryPercentage();
-            startTime = millis();
-            tries++;
-        }
-
-        delay(REPORT_RETRY_DELAY_MS);
-    }
-
-    return dataToSend == 0;
+    delay(REPORT_SEND_DELAY_MS);
 }
 
 // =============================================================================
@@ -203,9 +157,9 @@ void initializeZigbee() {
     zbTempSensor.setManufacturerAndModel("Espressif", "WetOrDead");
 
     // Temperature sensor configuration
-    zbTempSensor.setMinMaxValue(10.0f, 50.0f);
-    zbTempSensor.setDefaultValue(10.0f);
-    zbTempSensor.setTolerance(1.0f);
+    zbTempSensor.setMinMaxValue(-1000.0f, 6000.0f); // .01°C
+    zbTempSensor.setDefaultValue(1000.0f); // .01°C
+    zbTempSensor.setTolerance(1.0f); // .01°C
 
     // Humidity sensor configuration
     zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
@@ -215,7 +169,6 @@ void initializeZigbee() {
     // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
     zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
 
-    Zigbee.onGlobalDefaultResponse(onGlobalResponse);
     Zigbee.addEndpoint(&zbTempSensor);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
@@ -245,9 +198,9 @@ void setupAntenna() {
 
     // Switch RF to external antenna (XIAO ESP32C6 FM8625H RF switch)
     pinMode(3, OUTPUT);
-    digitalWrite(3, LOW);     // Power on the RF switch
+    digitalWrite(3, LOW);   // Power on the RF switch
     pinMode(14, OUTPUT);
-    digitalWrite(14, HIGH);   // Select external antenna
+    digitalWrite(14, HIGH); // Select external antenna
 }
 
 void setup() {
@@ -271,6 +224,7 @@ void setup() {
     if (!shouldSendData()) {
         // Small change -> go back to sleep
         enterDeepSleep();
+        return;
     }
     smallCycleCount = 0;
 
@@ -278,9 +232,8 @@ void setup() {
     readBatteryVoltage();
     initializeZigbee();
 
-    if (sendData()) {
-        previousMoistureValue = moisturePercentage;
-    }
+    sendData();
+    previousMoistureValue = moisturePercentage;
 
     enterDeepSleep();
 }
