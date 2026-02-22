@@ -7,7 +7,7 @@
 // =============================================================================
 
 // Sleep & Timing
-static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
+static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
 static const int SENSOR_WARMUP_MS          = 100;           // ms
 static const int REPORT_SEND_DELAY_MS      = 100;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
@@ -15,7 +15,7 @@ static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
 
 // Change detection
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
-static const int   FULL_UPDATE_INTERVAL      = 5;    // force send every N small cycles
+static const int   FULL_UPDATE_INTERVAL      = 1;    // force send every N small cycles
 
 // Analog Pins
 static const int POWER_SENSING_PIN    = 0; // A0
@@ -125,14 +125,13 @@ void readBatteryVoltage() {
 
 void sendData() {
     zbTempSensor.setTemperature(temperature);
-    zbTempSensor.setHumidity(moisturePercentage * 100.0f);
+    zbTempSensor.setHumidity(moisturePercentage);
     zbTempSensor.setBatteryPercentage(batteryPercentage);
-    zbTempSensor.setBatteryVoltage(batteryVoltage / 100.0f);
 
-    zbTempSensor.report();
-    zbTempSensor.reportBatteryPercentage();
+    bool success = zbTempSensor.report();
+    success &= zbTempSensor.reportBatteryPercentage();
 
-    delay(REPORT_SEND_DELAY_MS);
+    delay(1);
 }
 
 // =============================================================================
@@ -157,14 +156,14 @@ void initializeZigbee() {
     zbTempSensor.setManufacturerAndModel("Espressif", "WetOrDead");
 
     // Temperature sensor configuration
-    zbTempSensor.setMinMaxValue(-1000.0f, 6000.0f); // .01°C
-    zbTempSensor.setDefaultValue(1000.0f); // .01°C
-    zbTempSensor.setTolerance(1.0f); // .01°C
+    zbTempSensor.setMinMaxValue(-10.0f, 60.0f);
+    zbTempSensor.setDefaultValue(10.0f);
+    zbTempSensor.setTolerance(1.0f);
 
     // Humidity sensor configuration
     zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
 
-    // batteryPercentage = bootCount % 100; // TODO remove this debug code
+    batteryPercentage = bootCount % 100; // TODO remove this debug code
 
     // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
     zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
@@ -207,6 +206,9 @@ void setup() {
     bootCount++;
     smallCycleCount++;
 
+    float timings[4];
+    timings[0] = millis();
+
     Serial.begin(115200);
 
     // Allow firmware upload on first boot
@@ -230,11 +232,18 @@ void setup() {
 
     readTemperature();
     readBatteryVoltage();
+    timings[1] = millis();
     initializeZigbee();
-
+    timings[2] = millis();
     sendData();
+    timings[3] = millis();
     previousMoistureValue = moisturePercentage;
 
+    delay(2000);
+    printf("%f, %f, %f\n", timings[2] - timings[1], timings[3] - timings[2], timings[3] - timings[0]);
+    delay(2000);
+
+    
     enterDeepSleep();
 }
 
