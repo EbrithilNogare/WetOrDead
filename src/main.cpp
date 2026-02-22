@@ -15,7 +15,7 @@ static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
 
 // Change detection
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
-static const int   FULL_UPDATE_INTERVAL      = 1;    // force send every N small cycles
+static const int   FULL_UPDATE_INTERVAL      = 2;    // force send every N small cycles
 
 // Analog Pins
 static const int POWER_SENSING_PIN    = 0; // A0
@@ -23,15 +23,16 @@ static const int MOISTURE_SENSING_PIN = 1; // A1
 static const int MOISTURE_POWER_PIN   = 2; // D2
 
 // Battery Measurement
-static const int   BATTERY_AVERAGE_SAMPLES = 16;
-static const float VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
+static const int   ANALOG_AVERAGE_SAMPLES = 16;
+static const float VOLTAGE_DIVIDER_RATIO  = (300000.0f + 100000.0f) / 300000.0f;
 
 // Moisture Sensor Calibration (mV)
 static const float MOISTURE_WET_VOLTAGE = 3200.0f; // 1040.0f;
 static const float MOISTURE_DRY_VOLTAGE = 0.0f;    // 2080.0f;
 
 // Zigbee
-static const int ZIGBEE_ENDPOINT = 10;
+static const int ZIGBEE_ENDPOINT     = 10;
+static const int ZIGBEE_MAX_FAILURES = 3;
 
 // Battery discharge curve (voltage in mV for 0%, ..., 100%)
 static const float BATTERY_DISCHARGE_CURVE[] = {
@@ -46,7 +47,8 @@ static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / size
 
 RTC_DATA_ATTR long  bootCount             = 0;
 RTC_DATA_ATTR float previousMoistureValue = -100.0f;
-RTC_DATA_ATTR int   smallCycleCount       = 0;        // cycles since last full update
+RTC_DATA_ATTR int   smallCycleCount       = 0; // cycles since last full update
+RTC_DATA_ATTR int   zigbeeFailCount       = 0; // consecutive failures
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -75,7 +77,12 @@ void lightSleepForSensor() {
 }
 
 void readMoistureAdc() {
-    moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
+    uint32_t moistureVoltageSum = 0;
+    for (uint8_t i = 0; i < ANALOG_AVERAGE_SAMPLES; i++) {
+        moistureVoltageSum += analogReadMilliVolts(MOISTURE_SENSING_PIN);
+    }
+    moistureVoltage = (moistureVoltageSum / static_cast<float>(ANALOG_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
+
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
     moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
 
@@ -111,11 +118,11 @@ float voltageToPercent(float voltageMv) {
 void readBatteryVoltage() {
     uint32_t voltageSum = 0;
 
-    for (uint8_t i = 0; i < BATTERY_AVERAGE_SAMPLES; i++) {
+    for (uint8_t i = 0; i < ANALOG_AVERAGE_SAMPLES; i++) {
         voltageSum += analogReadMilliVolts(POWER_SENSING_PIN);
     }
 
-    batteryVoltage = (voltageSum / static_cast<float>(BATTERY_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
+    batteryVoltage = (voltageSum / static_cast<float>(ANALOG_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
     batteryPercentage = voltageToPercent(batteryVoltage);
 }
 
@@ -152,6 +159,16 @@ void enterDeepSleep() {
     esp_deep_sleep_start();
 }
 
+void zigbeeConnectFailed() {
+    zigbeeFailCount++;
+
+    if (zigbeeFailCount >= ZIGBEE_MAX_FAILURES) {
+        Zigbee.factoryReset();
+    }
+
+    enterDeepSleep();
+}
+
 void initializeZigbee() {
     zbTempSensor.setManufacturerAndModel("Espressif", "WetOrDead");
 
@@ -170,26 +187,27 @@ void initializeZigbee() {
 
     Zigbee.addEndpoint(&zbTempSensor);
 
+    bool eraseNvram = zigbeeFailCount >= ZIGBEE_MAX_FAILURES;
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    uint32_t connectTimeout = bootCount == 1 ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
-    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = connectTimeout;
+    uint32_t connectTimeout = (bootCount == 1 || eraseNvram) ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
+    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = TIME_TO_SLEEP_MS * FULL_UPDATE_INTERVAL * 3;
     Zigbee.setTimeout(connectTimeout);
 
-    if (!Zigbee.begin(&zigbeeConfig, false)) {
-        log_e("Zigbee failed to start, going to sleep");
-        smallCycleCount++;
-        enterDeepSleep();
+    if (!Zigbee.begin(&zigbeeConfig, eraseNvram)) {
+        log_w("Zigbee failed to start");
+        zigbeeConnectFailed();
     }
 
     unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
         if (millis() - connectStart >= connectTimeout) {
-            log_w("Zigbee connection timed out after %lu ms, going to sleep", connectTimeout);
-            enterDeepSleep();
+            log_w("Zigbee connection timed out");
+            zigbeeConnectFailed();
         }
-        log_i("Waiting for network connection");
         delay(20);
     }
+
+    zigbeeFailCount = 0;
 }
 
 void setupAntenna() {
@@ -206,8 +224,8 @@ void setup() {
     bootCount++;
     smallCycleCount++;
 
-    float timings[4];
-    timings[0] = millis();
+    //float timings[4];
+    //timings[0] = millis();
 
     Serial.begin(115200);
 
@@ -215,7 +233,7 @@ void setup() {
     if (bootCount == 1) {
         delay(10000);
     }
-    
+
     analogSetAttenuation(ADC_11db);
     setupAntenna();
 
@@ -232,18 +250,19 @@ void setup() {
 
     readTemperature();
     readBatteryVoltage();
-    timings[1] = millis();
+    
+    //timings[1] = millis();
     initializeZigbee();
-    timings[2] = millis();
+    
+    //timings[2] = millis();
     sendData();
-    timings[3] = millis();
+    
+    //timings[3] = millis();
     previousMoistureValue = moisturePercentage;
 
-    delay(2000);
-    printf("%f, %f, %f\n", timings[2] - timings[1], timings[3] - timings[2], timings[3] - timings[0]);
-    delay(2000);
-
-    
+    //delay(3000);
+    //printf("%f, %f, %f\n", timings[2] - timings[1], timings[3] - timings[2], timings[3] - timings[0]);
+    //delay(3000);
     enterDeepSleep();
 }
 
