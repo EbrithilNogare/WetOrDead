@@ -7,7 +7,7 @@
 // =============================================================================
 
 // Sleep & Timing
-static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
+static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
 static const int SENSOR_WARMUP_MS          = 100;           // ms
 static const int REPORT_SEND_DELAY_MS      = 100;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
@@ -15,7 +15,7 @@ static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
 
 // Change detection
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
-static const int   FULL_UPDATE_INTERVAL      = 5;    // force send every N small cycles
+static const int   FULL_UPDATE_INTERVAL      = 2;    // force send every N small cycles
 
 // Analog Pins
 static const int POWER_SENSING_PIN    = 0; // A0
@@ -23,16 +23,15 @@ static const int MOISTURE_SENSING_PIN = 1; // A1
 static const int MOISTURE_POWER_PIN   = 2; // D2
 
 // Battery Measurement
-static const int   ANALOG_AVERAGE_SAMPLES = 16;
-static const float VOLTAGE_DIVIDER_RATIO  = (300000.0f + 100000.0f) / 300000.0f;
+static const int   BATTERY_AVERAGE_SAMPLES = 16;
+static const float VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
 
 // Moisture Sensor Calibration (mV)
 static const float MOISTURE_WET_VOLTAGE = 3200.0f; // 1040.0f;
 static const float MOISTURE_DRY_VOLTAGE = 0.0f;    // 2080.0f;
 
 // Zigbee
-static const int ZIGBEE_ENDPOINT     = 10;
-static const int ZIGBEE_MAX_FAILURES = 3;
+static const int ZIGBEE_ENDPOINT = 10;
 
 // Battery discharge curve (voltage in mV for 0%, ..., 100%)
 static const float BATTERY_DISCHARGE_CURVE[] = {
@@ -47,8 +46,7 @@ static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / size
 
 RTC_DATA_ATTR long  bootCount             = 0;
 RTC_DATA_ATTR float previousMoistureValue = -100.0f;
-RTC_DATA_ATTR int   smallCycleCount       = 0; // cycles since last full update
-RTC_DATA_ATTR int   zigbeeFailCount       = 0; // consecutive failures
+RTC_DATA_ATTR int   smallCycleCount       = 0;        // cycles since last full update
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -77,12 +75,7 @@ void lightSleepForSensor() {
 }
 
 void readMoistureAdc() {
-    uint32_t moistureVoltageSum = 0;
-    for (uint8_t i = 0; i < ANALOG_AVERAGE_SAMPLES; i++) {
-        moistureVoltageSum += analogReadMilliVolts(MOISTURE_SENSING_PIN);
-    }
-    moistureVoltage = (moistureVoltageSum / static_cast<float>(ANALOG_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
-
+    moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
     moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
 
@@ -118,11 +111,11 @@ float voltageToPercent(float voltageMv) {
 void readBatteryVoltage() {
     uint32_t voltageSum = 0;
 
-    for (uint8_t i = 0; i < ANALOG_AVERAGE_SAMPLES; i++) {
+    for (uint8_t i = 0; i < BATTERY_AVERAGE_SAMPLES; i++) {
         voltageSum += analogReadMilliVolts(POWER_SENSING_PIN);
     }
 
-    batteryVoltage = (voltageSum / static_cast<float>(ANALOG_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
+    batteryVoltage = (voltageSum / static_cast<float>(BATTERY_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
     batteryPercentage = voltageToPercent(batteryVoltage);
 }
 
@@ -137,10 +130,6 @@ void sendData() {
 
     bool success = zbTempSensor.report();
     success &= zbTempSensor.reportBatteryPercentage();
-
-    if(success) {
-        previousMoistureValue = moisturePercentage;
-    }
 
     delay(1);
 }
@@ -163,16 +152,6 @@ void enterDeepSleep() {
     esp_deep_sleep_start();
 }
 
-void zigbeeConnectFailed() {
-    zigbeeFailCount++;
-
-    if (zigbeeFailCount >= ZIGBEE_MAX_FAILURES) {
-        Zigbee.factoryReset();
-    }
-
-    enterDeepSleep();
-}
-
 void initializeZigbee() {
     zbTempSensor.setManufacturerAndModel("Espressif", "WetOrDead");
 
@@ -182,7 +161,7 @@ void initializeZigbee() {
     zbTempSensor.setTolerance(1.0f);
 
     // Humidity sensor configuration
-    zbTempSensor.addHumiditySensor(0.0f, 100.0f, 0.1f, 0.0f);
+    zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
 
     batteryPercentage = bootCount % 100; // TODO remove this debug code
 
@@ -191,27 +170,26 @@ void initializeZigbee() {
 
     Zigbee.addEndpoint(&zbTempSensor);
 
-    bool eraseNvram = zigbeeFailCount >= ZIGBEE_MAX_FAILURES;
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    uint32_t connectTimeout = (bootCount == 1 || eraseNvram) ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
+    uint32_t connectTimeout = bootCount == 1 ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
     zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = connectTimeout;
     Zigbee.setTimeout(connectTimeout);
 
-    if (!Zigbee.begin(&zigbeeConfig, eraseNvram)) {
-        log_w("Zigbee failed to start");
-        zigbeeConnectFailed();
+    if (!Zigbee.begin(&zigbeeConfig, false)) {
+        log_e("Zigbee failed to start, going to sleep");
+        smallCycleCount++;
+        enterDeepSleep();
     }
 
     unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
         if (millis() - connectStart >= connectTimeout) {
-            log_w("Zigbee connection timed out");
-            zigbeeConnectFailed();
+            log_w("Zigbee connection timed out after %lu ms, going to sleep", connectTimeout);
+            enterDeepSleep();
         }
+        log_i("Waiting for network connection");
         delay(20);
     }
-
-    zigbeeFailCount = 0;
 }
 
 void setupAntenna() {
@@ -241,7 +219,7 @@ void setup() {
     Serial.begin(115200);
 
     firstBootSetup();
-
+    
     analogSetAttenuation(ADC_11db);
     setupAntenna();
 
@@ -257,9 +235,15 @@ void setup() {
 
     readTemperature();
     readBatteryVoltage();
-    
+
     initializeZigbee();
     sendData();
+    previousMoistureValue = moisturePercentage;
+
+    delay(2000);
+    printf("hi");
+    delay(2000);
+
     
     enterDeepSleep();
 }
