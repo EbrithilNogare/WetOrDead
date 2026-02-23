@@ -7,7 +7,7 @@
 // =============================================================================
 
 // Sleep & Timing
-static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
+static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
 static const int SENSOR_WARMUP_MS          = 100;           // ms
 static const int REPORT_SEND_DELAY_MS      = 100;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
@@ -15,7 +15,7 @@ static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
 
 // Change detection
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
-static const int   FULL_UPDATE_INTERVAL      = 2;    // force send every N small cycles
+static const int   FULL_UPDATE_INTERVAL      = 5;    // force send every N small cycles
 
 // Analog Pins
 static const int POWER_SENSING_PIN    = 0; // A0
@@ -138,6 +138,10 @@ void sendData() {
     bool success = zbTempSensor.report();
     success &= zbTempSensor.reportBatteryPercentage();
 
+    if(success) {
+        previousMoistureValue = moisturePercentage;
+    }
+
     delay(1);
 }
 
@@ -178,7 +182,7 @@ void initializeZigbee() {
     zbTempSensor.setTolerance(1.0f);
 
     // Humidity sensor configuration
-    zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
+    zbTempSensor.addHumiditySensor(0.0f, 100.0f, 0.1f, 0.0f);
 
     batteryPercentage = bootCount % 100; // TODO remove this debug code
 
@@ -190,7 +194,7 @@ void initializeZigbee() {
     bool eraseNvram = zigbeeFailCount >= ZIGBEE_MAX_FAILURES;
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
     uint32_t connectTimeout = (bootCount == 1 || eraseNvram) ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
-    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = TIME_TO_SLEEP_MS * FULL_UPDATE_INTERVAL * 3;
+    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = connectTimeout;
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, eraseNvram)) {
@@ -220,19 +224,23 @@ void setupAntenna() {
     digitalWrite(14, HIGH); // Select external antenna
 }
 
+void firstBootSetup() {
+    if (bootCount != 1) return;
+
+    // wait for first boot upload
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(10000);
+    digitalWrite(LED_BUILTIN, LOW);
+}
+
 void setup() {
     bootCount++;
     smallCycleCount++;
 
-    //float timings[4];
-    //timings[0] = millis();
-
     Serial.begin(115200);
 
-    // Allow firmware upload on first boot
-    if (bootCount == 1) {
-        delay(10000);
-    }
+    firstBootSetup();
 
     analogSetAttenuation(ADC_11db);
     setupAntenna();
@@ -242,7 +250,6 @@ void setup() {
     readMoistureAdc();
 
     if (!shouldSendData()) {
-        // Small change -> go back to sleep
         enterDeepSleep();
         return;
     }
@@ -251,18 +258,9 @@ void setup() {
     readTemperature();
     readBatteryVoltage();
     
-    //timings[1] = millis();
     initializeZigbee();
-    
-    //timings[2] = millis();
     sendData();
     
-    //timings[3] = millis();
-    previousMoistureValue = moisturePercentage;
-
-    //delay(3000);
-    //printf("%f, %f, %f\n", timings[2] - timings[1], timings[3] - timings[2], timings[3] - timings[0]);
-    //delay(3000);
     enterDeepSleep();
 }
 
