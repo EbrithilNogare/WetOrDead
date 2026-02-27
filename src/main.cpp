@@ -8,7 +8,7 @@
 
 // Sleep & Timing
 static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
-static const int SENSOR_WARMUP_MS          = 100;           // ms
+static const int SENSOR_WARMUP_MS          = 60;           // ms
 static const int REPORT_SEND_DELAY_MS      = 100;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
 static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
@@ -67,6 +67,7 @@ void readTemperature() {
 void moistureSensorPowerOn() {
     pinMode(MOISTURE_POWER_PIN, OUTPUT);
     digitalWrite(MOISTURE_POWER_PIN, HIGH);
+    gpio_hold_en((gpio_num_t)MOISTURE_POWER_PIN);
 }
 
 void lightSleepForSensor() {
@@ -79,6 +80,7 @@ void readMoistureAdc() {
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
     moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
 
+    gpio_hold_dis((gpio_num_t)MOISTURE_POWER_PIN);
     digitalWrite(MOISTURE_POWER_PIN, LOW);
     pinMode(MOISTURE_POWER_PIN, INPUT);
 }
@@ -202,23 +204,16 @@ void setupAntenna() {
     digitalWrite(14, HIGH); // Select external antenna
 }
 
-void firstBootSetup() {
-    if (bootCount != 1) return;
-
-    // wait for first boot upload
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(10000);
-    digitalWrite(LED_BUILTIN, LOW);
-}
-
 void setup() {
     bootCount++;
     smallCycleCount++;
 
     Serial.begin(115200);
 
-    firstBootSetup();
+    // Allow firmware upload on first boot
+    if (bootCount == 1) {
+        delay(10000);
+    }
     
     analogSetAttenuation(ADC_11db);
     setupAntenna();
@@ -228,6 +223,7 @@ void setup() {
     readMoistureAdc();
 
     if (!shouldSendData()) {
+        // Small change -> go back to sleep
         enterDeepSleep();
         return;
     }
@@ -235,16 +231,10 @@ void setup() {
 
     readTemperature();
     readBatteryVoltage();
-
     initializeZigbee();
     sendData();
     previousMoistureValue = moisturePercentage;
 
-    delay(2000);
-    printf("hi");
-    delay(2000);
-
-    
     enterDeepSleep();
 }
 
