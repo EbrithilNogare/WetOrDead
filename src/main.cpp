@@ -8,7 +8,7 @@
 
 // Sleep & Timing
 static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
-static const int SENSOR_WARMUP_MS          = 60;           // ms
+static const int SENSOR_WARMUP_MS          = 60;            // ms
 static const int REPORT_SEND_DELAY_MS      = 100;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
 static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
@@ -17,10 +17,11 @@ static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
 static const int   FULL_UPDATE_INTERVAL      = 2;    // force send every N small cycles
 
-// Analog Pins
-static const int POWER_SENSING_PIN    = 0; // A0
-static const int MOISTURE_SENSING_PIN = 1; // A1
-static const int MOISTURE_POWER_PIN   = 2; // D2
+// Pins
+static const int POWER_SENSING_PIN    =  0; // A0
+static const int MOISTURE_SENSING_PIN =  1; // A1
+static const int MOISTURE_POWER_PIN   =  2; // D2
+static const int USER_LED_PIN         = 15; // XIAO ESP32C6 user LED, active-low
 
 // Battery Measurement
 static const int   BATTERY_AVERAGE_SAMPLES = 16;
@@ -31,7 +32,8 @@ static const float MOISTURE_WET_VOLTAGE = 3200.0f; // 1040.0f;
 static const float MOISTURE_DRY_VOLTAGE = 0.0f;    // 2080.0f;
 
 // Zigbee
-static const int ZIGBEE_ENDPOINT = 10;
+static const int ZIGBEE_ENDPOINT                = 10;
+static const int ZIGBEE_FACTORY_RESET_THRESHOLD = 5;
 
 // Battery discharge curve (voltage in mV for 0%, ..., 100%)
 static const float BATTERY_DISCHARGE_CURVE[] = {
@@ -45,8 +47,9 @@ static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / size
 // =============================================================================
 
 RTC_DATA_ATTR long  bootCount             = 0;
-RTC_DATA_ATTR float previousMoistureValue = -100.0f;
 RTC_DATA_ATTR int   smallCycleCount       = 0;        // cycles since last full update
+RTC_DATA_ATTR int   unsuccessfulSendCount = 0;
+RTC_DATA_ATTR float previousMoistureValue = -100.0f;
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -55,6 +58,7 @@ float moisturePercentage = 0.0f; // %
 float moistureVoltage    = 0.0f; // mV
 float batteryPercentage  = 0.0f; // %
 float batteryVoltage     = 0.0f; // mV
+bool dataSendSuccessfuly = false;
 
 // =============================================================================
 // Sensor Reading
@@ -71,8 +75,16 @@ void moistureSensorPowerOn() {
 }
 
 void lightSleepForSensor() {
+    pinMode(USER_LED_PIN, OUTPUT);
+    digitalWrite(USER_LED_PIN, LOW); // active-low: LED on
+    gpio_hold_en((gpio_num_t)USER_LED_PIN);
+
     esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
     esp_light_sleep_start();
+    Serial.begin(115200);
+
+    gpio_hold_dis((gpio_num_t)USER_LED_PIN);
+    digitalWrite(USER_LED_PIN, HIGH); // LED off
 }
 
 void readMoistureAdc() {
@@ -130,10 +142,17 @@ void sendData() {
     zbTempSensor.setHumidity(moisturePercentage);
     zbTempSensor.setBatteryPercentage(batteryPercentage);
 
-    bool success = zbTempSensor.report();
-    success &= zbTempSensor.reportBatteryPercentage();
+    dataSendSuccessfuly = zbTempSensor.report();
+    dataSendSuccessfuly &= zbTempSensor.reportBatteryPercentage();
 
     delay(1);
+
+    if(dataSendSuccessfuly){
+        previousMoistureValue = moisturePercentage;
+        unsuccessfulSendCount = 0;
+    } else {
+        unsuccessfulSendCount++;
+    }
 }
 
 // =============================================================================
@@ -141,8 +160,6 @@ void sendData() {
 // =============================================================================
 
 void enterDeepSleep() {
-    log_i("Going to sleep now");
-
     long elapsedMs = millis();
     long sleepDurationMs = TIME_TO_SLEEP_MS - elapsedMs;
     
@@ -152,6 +169,16 @@ void enterDeepSleep() {
 
     esp_sleep_enable_timer_wakeup(sleepDurationMs * 1000L);
     esp_deep_sleep_start();
+}
+
+void checkStability() {
+    if (unsuccessfulSendCount >= ZIGBEE_FACTORY_RESET_THRESHOLD) {
+        unsuccessfulSendCount = -1;
+        Zigbee.factoryReset(false);
+        digitalWrite(USER_LED_PIN, LOW);
+        delay(10000);
+        digitalWrite(USER_LED_PIN, HIGH);
+    }
 }
 
 void initializeZigbee() {
@@ -165,7 +192,7 @@ void initializeZigbee() {
     // Humidity sensor configuration
     zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
 
-    batteryPercentage = bootCount % 100; // TODO remove this debug code
+    // batteryPercentage = bootCount % 100; // TODO remove this debug code
 
     // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
     zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
@@ -173,13 +200,13 @@ void initializeZigbee() {
     Zigbee.addEndpoint(&zbTempSensor);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    uint32_t connectTimeout = bootCount == 1 ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
+    uint32_t connectTimeout = bootCount == 1 || unsuccessfulSendCount == -1 ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
     zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = connectTimeout;
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
         log_e("Zigbee failed to start, going to sleep");
-        smallCycleCount++;
+        unsuccessfulSendCount++;
         enterDeepSleep();
     }
 
@@ -187,6 +214,7 @@ void initializeZigbee() {
     while (!Zigbee.connected()) {
         if (millis() - connectStart >= connectTimeout) {
             log_w("Zigbee connection timed out after %lu ms, going to sleep", connectTimeout);
+            unsuccessfulSendCount++;
             enterDeepSleep();
         }
         log_i("Waiting for network connection");
@@ -207,8 +235,6 @@ void setupAntenna() {
 void setup() {
     bootCount++;
     smallCycleCount++;
-
-    Serial.begin(115200);
 
     // Allow firmware upload on first boot
     if (bootCount == 1) {
@@ -231,9 +257,10 @@ void setup() {
 
     readTemperature();
     readBatteryVoltage();
+
+    checkStability();
     initializeZigbee();
     sendData();
-    previousMoistureValue = moisturePercentage;
 
     enterDeepSleep();
 }
