@@ -2,6 +2,8 @@
 
 #include "secrets.h"
 
+#define DEBUG_MODE true
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -50,6 +52,11 @@ RTC_DATA_ATTR long  bootCount             = 0;
 RTC_DATA_ATTR int   smallCycleCount       = 0;        // cycles since last full update
 RTC_DATA_ATTR int   unsuccessfulSendCount = 0;
 RTC_DATA_ATTR float previousMoistureValue = -100.0f;
+RTC_DATA_ATTR int   lastErrorCode         = 0;        // debug only
+
+#define ERROR_ZIGBEE_START_FAILED      10
+#define ERROR_DURING_SENDING_DATA      20
+#define ERROR_ZIGBEE_TIMEOUT           30
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -59,6 +66,7 @@ float moistureVoltage    = 0.0f; // mV
 float batteryPercentage  = 0.0f; // %
 float batteryVoltage     = 0.0f; // mV
 bool dataSendSuccessfuly = false;
+bool needFactoryReset    = false;
 
 // =============================================================================
 // Sensor Reading
@@ -145,13 +153,14 @@ void sendData() {
     dataSendSuccessfuly = zbTempSensor.report();
     dataSendSuccessfuly &= zbTempSensor.reportBatteryPercentage();
 
-    delay(1);
+    delay(REPORT_SEND_DELAY_MS);
 
     if(dataSendSuccessfuly){
         previousMoistureValue = moisturePercentage;
         unsuccessfulSendCount = 0;
     } else {
         unsuccessfulSendCount++;
+        lastErrorCode = ERROR_DURING_SENDING_DATA;
     }
 }
 
@@ -173,7 +182,7 @@ void enterDeepSleep() {
 
 void checkStability() {
     if (unsuccessfulSendCount >= ZIGBEE_FACTORY_RESET_THRESHOLD) {
-        unsuccessfulSendCount = -1;
+        needFactoryReset = true;
         Zigbee.factoryReset(false);
         digitalWrite(USER_LED_PIN, LOW);
         delay(10000);
@@ -192,21 +201,20 @@ void initializeZigbee() {
     // Humidity sensor configuration
     zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
 
-    // batteryPercentage = bootCount % 100; // TODO remove this debug code
-
     // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
     zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
 
     Zigbee.addEndpoint(&zbTempSensor);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    uint32_t connectTimeout = bootCount == 1 || unsuccessfulSendCount == -1 ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
+    uint32_t connectTimeout = bootCount == 1 || needFactoryReset ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
     zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = connectTimeout;
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
         log_e("Zigbee failed to start, going to sleep");
         unsuccessfulSendCount++;
+        lastErrorCode = ERROR_ZIGBEE_START_FAILED;
         enterDeepSleep();
     }
 
@@ -215,6 +223,7 @@ void initializeZigbee() {
         if (millis() - connectStart >= connectTimeout) {
             log_w("Zigbee connection timed out after %lu ms, going to sleep", connectTimeout);
             unsuccessfulSendCount++;
+            lastErrorCode = ERROR_ZIGBEE_TIMEOUT;
             enterDeepSleep();
         }
         log_i("Waiting for network connection");
@@ -260,6 +269,12 @@ void setup() {
 
     checkStability();
     initializeZigbee();
+
+#if DEBUG_MODE
+    batteryPercentage = bootCount % 100;
+    temperature = lastErrorCode;
+#endif
+
     sendData();
 
     enterDeepSleep();
