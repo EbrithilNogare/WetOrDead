@@ -2,14 +2,18 @@
 
 #include "secrets.h"
 
-#define DEBUG_MODE true
+#define DEBUG_MODE false
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
 // Sleep & Timing
+#if DEBUG_MODE
 static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
+#else
+static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
+#endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
 static const int REPORT_SEND_DELAY_MS      = 100;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
