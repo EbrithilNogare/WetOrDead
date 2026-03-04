@@ -15,13 +15,17 @@ static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
 static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
 #endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
-static const int REPORT_SEND_DELAY_MS      = 100;           // ms
+static const int REPORT_WAIT_TIMEOUT_MS    = 300;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
 static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
 
 // Change detection
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
-static const int   FULL_UPDATE_INTERVAL      = 2;    // force send every N small cycles
+#if DEBUG_MODE
+static const int   FULL_UPDATE_INTERVAL      = 2;
+#else
+static const int   FULL_UPDATE_INTERVAL      = 5;    // force send every N small cycles
+#endif
 
 // Pins
 static const int POWER_SENSING_PIN    =  0; // A0
@@ -56,11 +60,6 @@ RTC_DATA_ATTR long  bootCount             = 0;
 RTC_DATA_ATTR int   smallCycleCount       = 0;        // cycles since last full update
 RTC_DATA_ATTR int   unsuccessfulSendCount = 0;
 RTC_DATA_ATTR float previousMoistureValue = -100.0f;
-RTC_DATA_ATTR int   lastErrorCode         = 0;        // debug only
-
-#define ERROR_ZIGBEE_START_FAILED      10
-#define ERROR_DURING_SENDING_DATA      20
-#define ERROR_ZIGBEE_TIMEOUT           30
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -71,6 +70,7 @@ float batteryPercentage  = 0.0f; // %
 float batteryVoltage     = 0.0f; // mV
 bool dataSendSuccessfuly = false;
 bool needFactoryReset    = false;
+int dataToSend           = 0;
 
 // =============================================================================
 // Sensor Reading
@@ -117,9 +117,8 @@ bool shouldSendData() {
 }
 
 float voltageToPercent(float voltageMv) {
-    if (voltageMv <= BATTERY_DISCHARGE_CURVE[0]) {
+    if (voltageMv <= BATTERY_DISCHARGE_CURVE[0])
         return 0.0f;
-    }
 
     for (size_t i = 1; i < BATTERY_CURVE_SIZE; i++) {
         if (voltageMv < BATTERY_DISCHARGE_CURVE[i]) {
@@ -149,22 +148,35 @@ void readBatteryVoltage() {
 // Data Transmission
 // =============================================================================
 
+void onGlobalResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
+    if (command == ZB_CMD_REPORT_ATTRIBUTE && endpoint == ZIGBEE_ENDPOINT && status == ESP_ZB_ZCL_STATUS_SUCCESS)
+        dataToSend--;
+}
+
+bool responseChecker() {
+    unsigned long startMs = millis();
+    while (dataToSend > 0) {
+        if (millis() - startMs >= REPORT_WAIT_TIMEOUT_MS)
+            return false;
+        delay(10);
+    }
+    return true;
+}
+
 void sendData() {
     zbTempSensor.setTemperature(temperature);
     zbTempSensor.setHumidity(moisturePercentage);
     zbTempSensor.setBatteryPercentage(batteryPercentage);
 
-    dataSendSuccessfuly = zbTempSensor.report();
-    dataSendSuccessfuly &= zbTempSensor.reportBatteryPercentage();
+    dataToSend = 0;
+    if (zbTempSensor.report())                  dataToSend++;
+    if (zbTempSensor.reportBatteryPercentage()) dataToSend++;
 
-    delay(REPORT_SEND_DELAY_MS);
+    dataSendSuccessfuly = (dataToSend > 0) && responseChecker();
 
-    if(dataSendSuccessfuly){
+    if (dataSendSuccessfuly) {
         previousMoistureValue = moisturePercentage;
         unsuccessfulSendCount = 0;
-    } else {
-        unsuccessfulSendCount++;
-        lastErrorCode = ERROR_DURING_SENDING_DATA;
     }
 }
 
@@ -208,6 +220,7 @@ void initializeZigbee() {
     // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
     zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
 
+    Zigbee.onGlobalDefaultResponse(onGlobalResponse);
     Zigbee.addEndpoint(&zbTempSensor);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
@@ -216,21 +229,18 @@ void initializeZigbee() {
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
-        log_e("Zigbee failed to start, going to sleep");
         unsuccessfulSendCount++;
-        lastErrorCode = ERROR_ZIGBEE_START_FAILED;
         enterDeepSleep();
+        return;
     }
 
     unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
         if (millis() - connectStart >= connectTimeout) {
-            log_w("Zigbee connection timed out after %lu ms, going to sleep", connectTimeout);
             unsuccessfulSendCount++;
-            lastErrorCode = ERROR_ZIGBEE_TIMEOUT;
             enterDeepSleep();
+            return;
         }
-        log_i("Waiting for network connection");
         delay(20);
     }
 }
@@ -276,7 +286,7 @@ void setup() {
 
 #if DEBUG_MODE
     batteryPercentage = bootCount % 100;
-    temperature = lastErrorCode;
+    temperature = unsuccessfulSendCount * 10.0f;
 #endif
 
     sendData();
