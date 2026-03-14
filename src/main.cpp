@@ -225,7 +225,7 @@ void initializeZigbee() {
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
     uint32_t connectTimeout = bootCount == 1 || needFactoryReset ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
-    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = connectTimeout;
+    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = FULL_UPDATE_INTERVAL * TIME_TO_SLEEP_MS * 2 + 10000;
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
@@ -285,8 +285,7 @@ void setup() {
     initializeZigbee();
 
 #if DEBUG_MODE
-    batteryPercentage = bootCount % 100;
-    temperature = unsuccessfulSendCount * 10.0f;
+    temperature = bootCount % 100;
 #endif
 
     sendData();
