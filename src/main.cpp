@@ -1,41 +1,35 @@
 #include "Zigbee.h"
 
-#include "secrets.h"
-
-#define DEBUG_MODE false
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-// Sleep & Timing
+#define DEBUG_MODE true
+
 #if DEBUG_MODE
 static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 2;
 #else
 static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 5;
 #endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
 static const int REPORT_WAIT_TIMEOUT_MS    = 300;           // ms
 static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
 static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
-
-// Change detection
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
-#if DEBUG_MODE
-static const int   FULL_UPDATE_INTERVAL      = 2;
-#else
-static const int   FULL_UPDATE_INTERVAL      = 5;    // force send every N small cycles
-#endif
 
 // Pins
-static const int POWER_SENSING_PIN    =  0; // A0
-static const int MOISTURE_SENSING_PIN =  1; // A1
-static const int MOISTURE_POWER_PIN   =  2; // D2
-static const int USER_LED_PIN         = 15; // XIAO ESP32C6 user LED, active-low
+static const int PIN_BATTERY          =  0; // A0
+static const int PIN_MOISTURE         =  1; // A1
+static const int PIN_MOISTURE_PWR     =  2; // D2
+static const int PIN_USER_LED         = 15; // XIAO ESP32C6 user LED, active-low
 
-// Battery Measurement
+// Battery
 static const int   BATTERY_AVERAGE_SAMPLES = 16;
 static const float VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
+static const float BATTERY_CURVE[] = { 3100, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4200 };
 
 // Moisture Sensor Calibration (mV)
 static const float MOISTURE_WET_VOLTAGE = 3200.0f; // 1040.0f;
@@ -45,21 +39,17 @@ static const float MOISTURE_DRY_VOLTAGE = 0.0f;    // 2080.0f;
 static const int ZIGBEE_ENDPOINT                = 10;
 static const int ZIGBEE_FACTORY_RESET_THRESHOLD = 5;
 
-// Battery discharge curve (voltage in mV for 0%, ..., 100%)
-static const float BATTERY_DISCHARGE_CURVE[] = {
-    3100, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100
-};
 
-static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_DISCHARGE_CURVE) / sizeof(BATTERY_DISCHARGE_CURVE[0]);
+static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_CURVE) / sizeof(BATTERY_CURVE[0]);
 
 // =============================================================================
 // Global State
 // =============================================================================
 
 RTC_DATA_ATTR long  bootCount             = 0;
-RTC_DATA_ATTR int   smallCycleCount       = 0;        // cycles since last full update
-RTC_DATA_ATTR int   unsuccessfulSendCount = 0;
-RTC_DATA_ATTR float previousMoistureValue = -100.0f;
+RTC_DATA_ATTR int   cyclesSinceUpdate     = 0;
+RTC_DATA_ATTR int   failCount             = 0;
+RTC_DATA_ATTR float lastMoisture          = -100.0f;
 
 ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
 
@@ -81,49 +71,49 @@ void readTemperature() {
 }
 
 void moistureSensorPowerOn() {
-    pinMode(MOISTURE_POWER_PIN, OUTPUT);
-    digitalWrite(MOISTURE_POWER_PIN, HIGH);
-    gpio_hold_en((gpio_num_t)MOISTURE_POWER_PIN);
+    pinMode(PIN_MOISTURE_PWR, OUTPUT);
+    digitalWrite(PIN_MOISTURE_PWR, HIGH);
+    gpio_hold_en((gpio_num_t)PIN_MOISTURE_PWR);
 }
 
 void lightSleepForSensor() {
-    pinMode(USER_LED_PIN, OUTPUT);
-    digitalWrite(USER_LED_PIN, LOW); // active-low: LED on
-    gpio_hold_en((gpio_num_t)USER_LED_PIN);
+    pinMode(PIN_USER_LED, OUTPUT);
+    digitalWrite(PIN_USER_LED, LOW); // active-low: LED on
+    gpio_hold_en((gpio_num_t)PIN_USER_LED);
 
     esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
     esp_light_sleep_start();
     Serial.begin(115200);
 
-    gpio_hold_dis((gpio_num_t)USER_LED_PIN);
-    digitalWrite(USER_LED_PIN, HIGH); // LED off
+    gpio_hold_dis((gpio_num_t)PIN_USER_LED);
+    digitalWrite(PIN_USER_LED, HIGH); // LED off
 }
 
 void readMoistureAdc() {
-    moistureVoltage = analogReadMilliVolts(MOISTURE_SENSING_PIN);
+    moistureVoltage = analogReadMilliVolts(PIN_MOISTURE);
     moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
     moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
 
-    gpio_hold_dis((gpio_num_t)MOISTURE_POWER_PIN);
-    digitalWrite(MOISTURE_POWER_PIN, LOW);
-    pinMode(MOISTURE_POWER_PIN, INPUT);
+    gpio_hold_dis((gpio_num_t)PIN_MOISTURE_PWR);
+    digitalWrite(PIN_MOISTURE_PWR, LOW);
+    pinMode(PIN_MOISTURE_PWR, INPUT);
 }
 
 bool shouldSendData() {
-    if (smallCycleCount >= FULL_UPDATE_INTERVAL)
+    if (cyclesSinceUpdate >= FULL_UPDATE_INTERVAL)
         return true;
 
-    return fabs(moisturePercentage - previousMoistureValue) >= MOISTURE_CHANGE_THRESHOLD;
+    return fabs(moisturePercentage - lastMoisture) >= MOISTURE_CHANGE_THRESHOLD;
 }
 
 float voltageToPercent(float voltageMv) {
-    if (voltageMv <= BATTERY_DISCHARGE_CURVE[0])
+    if (voltageMv <= BATTERY_CURVE[0])
         return 0.0f;
 
     for (size_t i = 1; i < BATTERY_CURVE_SIZE; i++) {
-        if (voltageMv < BATTERY_DISCHARGE_CURVE[i]) {
-            float lowerVoltage = BATTERY_DISCHARGE_CURVE[i - 1];
-            float upperVoltage = BATTERY_DISCHARGE_CURVE[i];
+        if (voltageMv < BATTERY_CURVE[i]) {
+            float lowerVoltage = BATTERY_CURVE[i - 1];
+            float upperVoltage = BATTERY_CURVE[i];
             float lowerPercent = (i - 1) * 10.0f;
             float upperPercent = i * 10.0f;
             return map(voltageMv, lowerVoltage, upperVoltage, lowerPercent, upperPercent);
@@ -137,7 +127,7 @@ void readBatteryVoltage() {
     uint32_t voltageSum = 0;
 
     for (uint8_t i = 0; i < BATTERY_AVERAGE_SAMPLES; i++) {
-        voltageSum += analogReadMilliVolts(POWER_SENSING_PIN);
+        voltageSum += analogReadMilliVolts(PIN_BATTERY);
     }
 
     batteryVoltage = (voltageSum / static_cast<float>(BATTERY_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
@@ -175,8 +165,8 @@ void sendData() {
     dataSendSuccessfuly = (dataToSend > 0) && responseChecker();
 
     if (dataSendSuccessfuly) {
-        previousMoistureValue = moisturePercentage;
-        unsuccessfulSendCount = 0;
+        lastMoisture = moisturePercentage;
+        failCount = 0;
     }
 }
 
@@ -197,12 +187,12 @@ void enterDeepSleep() {
 }
 
 void checkStability() {
-    if (unsuccessfulSendCount >= ZIGBEE_FACTORY_RESET_THRESHOLD) {
+    if (failCount >= ZIGBEE_FACTORY_RESET_THRESHOLD) {
         needFactoryReset = true;
         Zigbee.factoryReset(false);
-        digitalWrite(USER_LED_PIN, LOW);
+        digitalWrite(PIN_USER_LED, LOW);
         delay(10000);
-        digitalWrite(USER_LED_PIN, HIGH);
+        digitalWrite(PIN_USER_LED, HIGH);
     }
 }
 
@@ -229,7 +219,7 @@ void initializeZigbee() {
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, false)) {
-        unsuccessfulSendCount++;
+        failCount++;
         enterDeepSleep();
         return;
     }
@@ -237,7 +227,7 @@ void initializeZigbee() {
     unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
         if (millis() - connectStart >= connectTimeout) {
-            unsuccessfulSendCount++;
+            failCount++;
             enterDeepSleep();
             return;
         }
@@ -247,7 +237,6 @@ void initializeZigbee() {
 
 void setupAntenna() {
     esp_zb_set_tx_power(20); // dBm
-
     // Switch RF to external antenna (XIAO ESP32C6 FM8625H RF switch)
     pinMode(3, OUTPUT);
     digitalWrite(3, LOW);   // Power on the RF switch
@@ -257,7 +246,7 @@ void setupAntenna() {
 
 void setup() {
     bootCount++;
-    smallCycleCount++;
+    cyclesSinceUpdate++;
 
     // Allow firmware upload on first boot
     if (bootCount == 1) {
@@ -276,7 +265,7 @@ void setup() {
         enterDeepSleep();
         return;
     }
-    smallCycleCount = 0;
+    cyclesSinceUpdate = 0;
 
     readTemperature();
     readBatteryVoltage();
