@@ -1,6 +1,6 @@
 #include "Zigbee.h"
 #include "ep/ZigbeeAnalog.h"
-
+#include "Arduino.h"
 
 // =============================================================================
 // Configuration
@@ -82,7 +82,9 @@ void lightSleepForSensor() {
 
     esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
     esp_light_sleep_start();
+#if DEBUG_MODE
     Serial.begin(115200);
+#endif
 
 #if DEBUG_MODE
     gpio_hold_dis((gpio_num_t)PIN_USER_LED);
@@ -242,6 +244,13 @@ void setupAntenna() {
     digitalWrite(14, HIGH); // Select external antenna
 }
 
+void forceHeartbeat()
+{
+    heartbeat = !heartbeat;
+    moisturePercentage += heartbeat;
+    batteryPercentage += heartbeat;
+}
+
 void setup() {
     bootCount++;
     cyclesSinceUpdate++;
@@ -270,12 +279,7 @@ void setup() {
     checkStability();
     initializeZigbee();
 
-#ifdef DEBUG_MODE
-    heartbeat = !heartbeat;
-    moisturePercentage += heartbeat;
-    batteryPercentage += heartbeat;
-#endif
-
+    forceHeartbeat();
     sendData();
 
 #if DEBUG_MODE
