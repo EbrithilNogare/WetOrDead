@@ -1,4 +1,5 @@
 #include "Zigbee.h"
+#include "ep/ZigbeeAnalog.h"
 
 
 // =============================================================================
@@ -29,11 +30,11 @@ static const int PIN_USER_LED         = 15; // XIAO ESP32C6 user LED, active-low
 // Battery
 static const int   BATTERY_AVERAGE_SAMPLES = 16;
 static const float VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
-static const float BATTERY_CURVE[] = { 3100, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4200 };
+static const float BATTERY_CURVE[] = { 3200, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100 };
 
 // Moisture Sensor Calibration (mV)
-static const float MOISTURE_WET_VOLTAGE = 3200.0f; // 1040.0f;
-static const float MOISTURE_DRY_VOLTAGE = 0.0f;    // 2080.0f;
+static const float MOISTURE_WET_VOLTAGE = 3200.0f;
+static const float MOISTURE_DRY_VOLTAGE = 0.0f;
 
 // Zigbee
 static const int ZIGBEE_ENDPOINT                = 10;
@@ -50,10 +51,10 @@ RTC_DATA_ATTR long  bootCount             = 0;
 RTC_DATA_ATTR int   cyclesSinceUpdate     = 0;
 RTC_DATA_ATTR int   failCount             = 0;
 RTC_DATA_ATTR float lastMoisture          = -100.0f;
+RTC_DATA_ATTR bool  heartbeat             = false;
 
-ZigbeeTempSensor zbTempSensor(ZIGBEE_ENDPOINT);
+ZigbeeAnalog zbAnalog(ZIGBEE_ENDPOINT);
 
-float temperature        = 0.0f; // °C
 float moisturePercentage = 0.0f; // %
 float moistureVoltage    = 0.0f; // mV
 float batteryPercentage  = 0.0f; // %
@@ -66,10 +67,6 @@ int dataToSend           = 0;
 // Sensor Reading
 // =============================================================================
 
-void readTemperature() {
-    temperature = temperatureRead();
-}
-
 void moistureSensorPowerOn() {
     pinMode(PIN_MOISTURE_PWR, OUTPUT);
     digitalWrite(PIN_MOISTURE_PWR, HIGH);
@@ -77,16 +74,21 @@ void moistureSensorPowerOn() {
 }
 
 void lightSleepForSensor() {
+#if DEBUG_MODE
     pinMode(PIN_USER_LED, OUTPUT);
     digitalWrite(PIN_USER_LED, LOW); // active-low: LED on
     gpio_hold_en((gpio_num_t)PIN_USER_LED);
+#endif
 
     esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
     esp_light_sleep_start();
     Serial.begin(115200);
 
+#if DEBUG_MODE
     gpio_hold_dis((gpio_num_t)PIN_USER_LED);
     digitalWrite(PIN_USER_LED, HIGH); // LED off
+    pinMode(PIN_USER_LED, INPUT);
+#endif
 }
 
 void readMoistureAdc() {
@@ -154,13 +156,12 @@ bool responseChecker() {
 }
 
 void sendData() {
-    zbTempSensor.setTemperature(temperature);
-    zbTempSensor.setHumidity(moisturePercentage);
-    zbTempSensor.setBatteryPercentage(batteryPercentage);
+    zbAnalog.setAnalogInput(moisturePercentage);
+    zbAnalog.setBatteryPercentage((uint8_t)batteryPercentage);
 
     dataToSend = 0;
-    if (zbTempSensor.report())                  dataToSend++;
-    if (zbTempSensor.reportBatteryPercentage()) dataToSend++;
+    if (zbAnalog.reportBatteryPercentage()) dataToSend++; // we are not getting confirmation for battery percentage
+    if (zbAnalog.reportAnalogInput()) dataToSend++;
 
     dataSendSuccessfuly = (dataToSend > 0) && responseChecker();
 
@@ -177,7 +178,7 @@ void sendData() {
 void enterDeepSleep() {
     long elapsedMs = millis();
     long sleepDurationMs = TIME_TO_SLEEP_MS - elapsedMs;
-    
+
     if(sleepDurationMs < 1000L) {
         sleepDurationMs = 1000L;
     }
@@ -197,21 +198,18 @@ void checkStability() {
 }
 
 void initializeZigbee() {
-    zbTempSensor.setManufacturerAndModel("Espressif", "WetOrDead");
+    zbAnalog.setManufacturerAndModel("Espressif", "WetOrDead");
+    zbAnalog.addAnalogInput();
+    zbAnalog.setAnalogInputDescription("Humidity");
+    zbAnalog.setAnalogInputApplication(ESP_ZB_ZCL_AI_HUMIDITY_SPACE);
+    zbAnalog.setAnalogInputMinMax(0.0f, 100.0f);
+    zbAnalog.setAnalogInputResolution(0.1f);
+    zbAnalog.setAnalogInputReporting(0, TIME_TO_SLEEP_MS / 1000 * FULL_UPDATE_INTERVAL, 0.5f);
 
-    // Temperature sensor configuration
-    zbTempSensor.setMinMaxValue(-10.0f, 60.0f);
-    zbTempSensor.setDefaultValue(10.0f);
-    zbTempSensor.setTolerance(1.0f);
-
-    // Humidity sensor configuration
-    zbTempSensor.addHumiditySensor(0.0f, 100.0f, 1.0f, 0.0f);
-
-    // Power source configuration (voltage in 100mV units, e.g. 37 = 3.7V)
-    zbTempSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercentage, batteryVoltage / 100.0f);
+    zbAnalog.setPowerSource(ZB_POWER_SOURCE_BATTERY, (uint8_t)batteryPercentage, (uint8_t)(batteryVoltage / 100.0f));
 
     Zigbee.onGlobalDefaultResponse(onGlobalResponse);
-    Zigbee.addEndpoint(&zbTempSensor);
+    Zigbee.addEndpoint(&zbAnalog);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
     uint32_t connectTimeout = bootCount == 1 || needFactoryReset ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
@@ -252,7 +250,7 @@ void setup() {
     if (bootCount == 1) {
         delay(10000);
     }
-    
+
     analogSetAttenuation(ADC_11db);
     setupAntenna();
 
@@ -267,17 +265,24 @@ void setup() {
     }
     cyclesSinceUpdate = 0;
 
-    readTemperature();
     readBatteryVoltage();
 
     checkStability();
     initializeZigbee();
 
-#if DEBUG_MODE
-    temperature = bootCount % 100;
+#ifdef DEBUG_MODE
+    heartbeat = !heartbeat;
+    moisturePercentage += heartbeat;
+    batteryPercentage += heartbeat;
 #endif
 
     sendData();
+
+#if DEBUG_MODE
+    delay(4000);
+    Serial.printf("Data send %s. Moisture: %.2f%%, Battery: %.2f%%\r\n", dataSendSuccessfuly ? "successful" : "failed", moisturePercentage, batteryPercentage);
+    delay(4000);
+#endif
 
     enterDeepSleep();
 }
