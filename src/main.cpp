@@ -9,8 +9,8 @@
 #define DEBUG_MODE true
 
 #if DEBUG_MODE
-static const int TIME_TO_SLEEP_MS          = 1 * 10 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 2;
+static const int TIME_TO_SLEEP_MS          = 1 * 60 * 60 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 12;
 #else
 static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
 static const int FULL_UPDATE_INTERVAL      = 5;
@@ -82,9 +82,7 @@ void lightSleepForSensor() {
 
     esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
     esp_light_sleep_start();
-#if DEBUG_MODE
-    Serial.begin(115200);
-#endif
+    Serial.begin(115200); // reinit after light sleep (APB clock is gated during sleep)
 
 #if DEBUG_MODE
     gpio_hold_dis((gpio_num_t)PIN_USER_LED);
@@ -214,11 +212,11 @@ void initializeZigbee() {
     Zigbee.addEndpoint(&zbAnalog);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    uint32_t connectTimeout = bootCount == 1 || needFactoryReset ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
+    uint32_t connectTimeout = (bootCount == 1 || needFactoryReset) ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
     zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = FULL_UPDATE_INTERVAL * TIME_TO_SLEEP_MS * 2 + 10000;
     Zigbee.setTimeout(connectTimeout);
 
-    if (!Zigbee.begin(&zigbeeConfig, false)) {
+    if (!Zigbee.begin(&zigbeeConfig, needFactoryReset)) {
         failCount++;
         enterDeepSleep();
         return;
@@ -247,13 +245,16 @@ void setupAntenna() {
 void forceHeartbeat()
 {
     heartbeat = !heartbeat;
-    moisturePercentage += heartbeat;
+    moisturePercentage += heartbeat/10.0f;
     batteryPercentage += heartbeat;
 }
 
 void setup() {
     bootCount++;
     cyclesSinceUpdate++;
+
+    Serial.begin(115200);
+    Serial.printf("\r\n=== Boot #%ld ===\r\n", bootCount);
 
     // Allow firmware upload on first boot
     if (bootCount == 1) {
@@ -267,26 +268,28 @@ void setup() {
     lightSleepForSensor();
     readMoistureAdc();
 
+    Serial.printf("Moisture: %.2f%% (%.0f mV)\r\n", moisturePercentage, moistureVoltage);
+
     if (!shouldSendData()) {
         // Small change -> go back to sleep
+        Serial.println("No significant change, sleeping...");
         enterDeepSleep();
         return;
     }
     cyclesSinceUpdate = 0;
 
     readBatteryVoltage();
+    Serial.printf("Battery: %.2f%% (%.0f mV)\r\n", batteryPercentage, batteryVoltage);
 
     checkStability();
+    Serial.println("Connecting to Zigbee...");
     initializeZigbee();
 
     forceHeartbeat();
     sendData();
 
-#if DEBUG_MODE
-    delay(4000);
     Serial.printf("Data send %s. Moisture: %.2f%%, Battery: %.2f%%\r\n", dataSendSuccessfuly ? "successful" : "failed", moisturePercentage, batteryPercentage);
-    delay(4000);
-#endif
+    delay(200);
 
     enterDeepSleep();
 }
