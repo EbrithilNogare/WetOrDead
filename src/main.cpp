@@ -16,9 +16,9 @@ static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
 static const int FULL_UPDATE_INTERVAL      = 5;
 #endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
-static const int REPORT_WAIT_TIMEOUT_MS    = 300;           // ms
-static const int ZIGBEE_CONNECT_TIMEOUT_MS = 2000;          // ms
-static const int ZIGBEE_PAIRING_TIMEOUT_MS = 30000;         // ms
+static const int REPORT_WAIT_TIMEOUT_MS    = 2000;          // ms
+static const int ZIGBEE_CONNECT_TIMEOUT_MS = 15000;         // ms
+static const int ZIGBEE_PAIRING_TIMEOUT_MS = 60000;         // ms
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
 
 // Pins
@@ -52,6 +52,8 @@ RTC_DATA_ATTR int   cyclesSinceUpdate     = 0;
 RTC_DATA_ATTR int   failCount             = 0;
 RTC_DATA_ATTR float lastMoisture          = -100.0f;
 RTC_DATA_ATTR bool  heartbeat             = false;
+RTC_DATA_ATTR long  totalFailures         = 0; // diagnostic: cumulative failed cycles
+RTC_DATA_ATTR long  totalResets           = 0; // diagnostic: cumulative factory resets
 
 ZigbeeAnalog zbAnalog(ZIGBEE_ENDPOINT);
 
@@ -160,14 +162,18 @@ void sendData() {
     zbAnalog.setBatteryPercentage((uint8_t)batteryPercentage);
 
     dataToSend = 0;
-    if (zbAnalog.reportBatteryPercentage()) dataToSend++; // we are not getting confirmation for battery percentage
-    if (zbAnalog.reportAnalogInput()) dataToSend++;
+    int attemptedReports = 0;
+    if (zbAnalog.reportBatteryPercentage()) { dataToSend++; attemptedReports++; } // no confirmation for battery percentage
+    if (zbAnalog.reportAnalogInput())       { dataToSend++; attemptedReports++; }
 
-    dataSendSuccessfuly = (dataToSend > 0) && responseChecker();
+    dataSendSuccessfuly = (attemptedReports > 0) && responseChecker();
 
     if (dataSendSuccessfuly) {
         lastMoisture = moisturePercentage;
         failCount = 0;
+    } else {
+        failCount++;
+        totalFailures++;
     }
 }
 
@@ -190,10 +196,19 @@ void enterDeepSleep() {
 void checkStability() {
     if (failCount >= ZIGBEE_FACTORY_RESET_THRESHOLD) {
         needFactoryReset = true;
+        totalResets++;
+        failCount = 0; // reset counter so we don't loop-reset every wake
+        Serial.printf("!! Factory reset triggered (totalResets=%ld) !!\r\n", totalResets);
         Zigbee.factoryReset(false);
-        digitalWrite(PIN_USER_LED, LOW);
-        delay(10000);
-        digitalWrite(PIN_USER_LED, HIGH);
+
+        pinMode(PIN_USER_LED, OUTPUT);
+        for (int i = 0; i < 10; i++) {
+            digitalWrite(PIN_USER_LED, LOW);
+            delay(200);
+            digitalWrite(PIN_USER_LED, HIGH);
+            delay(200);
+        }
+        pinMode(PIN_USER_LED, INPUT);
     }
 }
 
@@ -213,11 +228,14 @@ void initializeZigbee() {
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
     uint32_t connectTimeout = (bootCount == 1 || needFactoryReset) ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
-    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = FULL_UPDATE_INTERVAL * TIME_TO_SLEEP_MS * 2 + 10000;
+    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 3000;
+    zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_16384MIN;
     Zigbee.setTimeout(connectTimeout);
 
     if (!Zigbee.begin(&zigbeeConfig, needFactoryReset)) {
+        Serial.println("Zigbee.begin() failed");
         failCount++;
+        totalFailures++;
         enterDeepSleep();
         return;
     }
@@ -225,12 +243,15 @@ void initializeZigbee() {
     unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
         if (millis() - connectStart >= connectTimeout) {
+            Serial.printf("Zigbee connect timeout (%lums)\r\n", (unsigned long)connectTimeout);
             failCount++;
+            totalFailures++;
             enterDeepSleep();
             return;
         }
         delay(20);
     }
+    Serial.printf("Zigbee connected in %lums\r\n", millis() - connectStart);
 }
 
 void setupAntenna() {
@@ -245,8 +266,8 @@ void setupAntenna() {
 void forceHeartbeat()
 {
     heartbeat = !heartbeat;
-    moisturePercentage += heartbeat/10.0f;
-    batteryPercentage += heartbeat;
+    if (heartbeat) moisturePercentage += 0.1f;
+    if (heartbeat) batteryPercentage += 1.0f;
 }
 
 void setup() {
@@ -254,7 +275,8 @@ void setup() {
     cyclesSinceUpdate++;
 
     Serial.begin(115200);
-    Serial.printf("\r\n=== Boot #%ld ===\r\n", bootCount);
+    Serial.printf("\r\n=== Boot #%ld (failCount=%d, totalFailures=%ld, totalResets=%ld) ===\r\n",
+                  bootCount, failCount, totalFailures, totalResets);
 
     // Allow firmware upload on first boot
     if (bootCount == 1) {
@@ -288,7 +310,9 @@ void setup() {
     forceHeartbeat();
     sendData();
 
-    Serial.printf("Data send %s. Moisture: %.2f%%, Battery: %.2f%%\r\n", dataSendSuccessfuly ? "successful" : "failed", moisturePercentage, batteryPercentage);
+    Serial.printf("Data send %s. Moisture: %.2f%%, Battery: %.2f%%, failCount=%d\r\n",
+                  dataSendSuccessfuly ? "successful" : "failed",
+                  moisturePercentage, batteryPercentage, failCount);
     delay(200);
 
     enterDeepSleep();
