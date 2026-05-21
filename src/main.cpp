@@ -9,11 +9,11 @@
 #define DEBUG_MODE true
 
 #if DEBUG_MODE
-static const int TIME_TO_SLEEP_MS          = 1 * 60 * 60 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 12;
+static const int TIME_TO_SLEEP_MS          = 30 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 2;
 #else
-static const int TIME_TO_SLEEP_MS          = 1 * 60 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 5;
+static const int TIME_TO_SLEEP_MS          = 60 * 60 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 6;
 #endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
 static const int REPORT_WAIT_TIMEOUT_MS    = 2000;          // ms
@@ -219,7 +219,9 @@ void initializeZigbee() {
     zbAnalog.setAnalogInputApplication(ESP_ZB_ZCL_AI_HUMIDITY_SPACE);
     zbAnalog.setAnalogInputMinMax(0.0f, 100.0f);
     zbAnalog.setAnalogInputResolution(0.1f);
-    zbAnalog.setAnalogInputReporting(0, TIME_TO_SLEEP_MS / 1000 * FULL_UPDATE_INTERVAL, 0.5f);
+    // setAnalogInputReporting() must be called AFTER Zigbee.begin() + connected,
+    // otherwise the ZCL reporting table write panics with
+    // "ZB OSIF: Zigbee lock is not ready!".
 
     zbAnalog.setPowerSource(ZB_POWER_SOURCE_BATTERY, (uint8_t)batteryPercentage, (uint8_t)(batteryVoltage / 100.0f));
 
@@ -252,15 +254,23 @@ void initializeZigbee() {
         delay(20);
     }
     Serial.printf("Zigbee connected in %lums\r\n", millis() - connectStart);
+
+    // Push the real attribute values immediately so ZHA's post-join interview
+    // reads them instead of the default 0 from addAnalogInput().
+    zbAnalog.setAnalogInput(moisturePercentage);
+    zbAnalog.setBatteryPercentage((uint8_t)batteryPercentage);
+
+    zbAnalog.setAnalogInputReporting(0, TIME_TO_SLEEP_MS / 1000 * FULL_UPDATE_INTERVAL, 0.5f);
 }
 
 void setupAntenna() {
     esp_zb_set_tx_power(20); // dBm
-    // Switch RF to external antenna (XIAO ESP32C6 FM8625H RF switch)
+    // XIAO ESP32C6 FM8625H RF switch: GPIO14 LOW = internal PCB antenna,
+    // HIGH = external IPEX. Switch to HIGH only if an external antenna is attached.
     pinMode(3, OUTPUT);
     digitalWrite(3, LOW);   // Power on the RF switch
     pinMode(14, OUTPUT);
-    digitalWrite(14, HIGH); // Select external antenna
+    digitalWrite(14, HIGH);  // External antenna
 }
 
 void forceHeartbeat()
