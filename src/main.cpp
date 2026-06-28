@@ -6,14 +6,14 @@
 // Configuration
 // =============================================================================
 
-#define DEBUG_MODE true
+#define DEBUG_MODE false
 
 #if DEBUG_MODE
-static const int TIME_TO_SLEEP_MS          = 30 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 2;
+static const int TIME_TO_SLEEP_MS          = 10 * 60 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 3;
 #else
-static const int TIME_TO_SLEEP_MS          = 60 * 60 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 6;
+static const int TIME_TO_SLEEP_MS          = 10 * 60 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 3;
 #endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
 static const int REPORT_WAIT_TIMEOUT_MS    = 2000;          // ms
@@ -22,14 +22,14 @@ static const int ZIGBEE_PAIRING_TIMEOUT_MS = 60000;         // ms
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
 
 // Pins
-static const int PIN_BATTERY          =  0; // A0
-static const int PIN_MOISTURE         =  1; // A1
-static const int PIN_MOISTURE_PWR     =  2; // D2
+static const int PIN_BATTERY          =  2; // A2
+static const int PIN_MOISTURE         =  0; // A0
+static const int PIN_MOISTURE_PWR     =  1; // D1
 static const int PIN_USER_LED         = 15; // XIAO ESP32C6 user LED, active-low
 
 // Battery
 static const int   BATTERY_AVERAGE_SAMPLES = 16;
-static const float VOLTAGE_DIVIDER_RATIO   = (300000.0f + 100000.0f) / 300000.0f;
+static const float VOLTAGE_DIVIDER_RATIO   = (220000.0f + 220000.0f) / 220000.0f;
 static const float BATTERY_CURVE[] = { 3200, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100 };
 
 // Moisture Sensor Calibration (mV)
