@@ -1,12 +1,26 @@
 #include "Zigbee.h"
 #include "ep/ZigbeeAnalog.h"
 #include "Arduino.h"
+#include "esp_system.h"
+#include <Preferences.h>
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
 #define DEBUG_MODE false
+
+#ifndef DEBUG_SERIAL
+#define DEBUG_SERIAL false
+#endif
+
+#if DEBUG_SERIAL
+#define LOG_BEGIN()  do { Serial.begin(115200); delay(3000); } while (0)
+#define LOG(...)     Serial.printf(__VA_ARGS__)
+#else
+#define LOG_BEGIN()  ((void)0)
+#define LOG(...)     ((void)0)
+#endif
 
 #if DEBUG_MODE
 static const int TIME_TO_SLEEP_MS          = 10 * 60 * 1000; // ms
@@ -17,8 +31,11 @@ static const int FULL_UPDATE_INTERVAL      = 3;
 #endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
 static const int REPORT_WAIT_TIMEOUT_MS    = 2000;          // ms
-static const int ZIGBEE_CONNECT_TIMEOUT_MS = 15000;         // ms
+static const int ZIGBEE_CONNECT_TIMEOUT_MS = 5000;          // ms
 static const int ZIGBEE_PAIRING_TIMEOUT_MS = 60000;         // ms
+static const int UPLOAD_WINDOW_MS          = 10000;         // ms
+static const int BACKOFF_MAX_SHIFT         = 6;
+static const long BACKOFF_MAX_SLEEP_MS     = 6L * 3600 * 1000; // ms
 static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
 
 // Pins
@@ -38,7 +55,9 @@ static const float MOISTURE_DRY_VOLTAGE = 0.0f;
 
 // Zigbee
 static const int ZIGBEE_ENDPOINT                = 10;
-static const int ZIGBEE_FACTORY_RESET_THRESHOLD = 5;
+static const int ZIGBEE_FACTORY_RESET_THRESHOLD = 20;
+static const char *NVS_NAMESPACE  = "wetordead";
+static const char *NVS_KEY_JOINED = "joined";
 
 
 static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_CURVE) / sizeof(BATTERY_CURVE[0]);
@@ -54,15 +73,16 @@ RTC_DATA_ATTR float lastMoisture          = -100.0f;
 RTC_DATA_ATTR bool  heartbeat             = false;
 RTC_DATA_ATTR long  totalFailures         = 0; // diagnostic: cumulative failed cycles
 RTC_DATA_ATTR long  totalResets           = 0; // diagnostic: cumulative factory resets
+RTC_DATA_ATTR bool  needFactoryReset      = false;
 
 ZigbeeAnalog zbAnalog(ZIGBEE_ENDPOINT);
+Preferences preferences;
 
 float moisturePercentage = 0.0f; // %
 float moistureVoltage    = 0.0f; // mV
 float batteryPercentage  = 0.0f; // %
 float batteryVoltage     = 0.0f; // mV
 bool dataSendSuccessfuly = false;
-bool needFactoryReset    = false;
 int dataToSend           = 0;
 
 // =============================================================================
@@ -84,7 +104,7 @@ void lightSleepForSensor() {
 
     esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
     esp_light_sleep_start();
-    Serial.begin(115200); // reinit after light sleep (APB clock is gated during sleep)
+    LOG_BEGIN(); // reinit after light sleep (APB clock is gated during sleep)
 
 #if DEBUG_MODE
     gpio_hold_dis((gpio_num_t)PIN_USER_LED);
@@ -181,35 +201,54 @@ void sendData() {
 // Setup & Main Loop
 // =============================================================================
 
+long backoffIntervalMs() {
+    if (failCount <= 0)
+        return TIME_TO_SLEEP_MS;
+
+    int shift = failCount < BACKOFF_MAX_SHIFT ? failCount : BACKOFF_MAX_SHIFT;
+    long intervalMs = (long)TIME_TO_SLEEP_MS << shift;
+
+    return intervalMs > BACKOFF_MAX_SLEEP_MS ? BACKOFF_MAX_SLEEP_MS : intervalMs;
+}
+
 void enterDeepSleep() {
     long elapsedMs = millis();
-    long sleepDurationMs = TIME_TO_SLEEP_MS - elapsedMs;
+    long sleepDurationMs = backoffIntervalMs() - elapsedMs;
 
     if(sleepDurationMs < 1000L) {
         sleepDurationMs = 1000L;
     }
 
+    LOG("Sleeping %lds (failCount=%d)\r\n", sleepDurationMs / 1000L, failCount);
     esp_sleep_enable_timer_wakeup(sleepDurationMs * 1000L);
     esp_deep_sleep_start();
 }
 
-void checkStability() {
-    if (failCount >= ZIGBEE_FACTORY_RESET_THRESHOLD) {
-        needFactoryReset = true;
-        totalResets++;
-        failCount = 0; // reset counter so we don't loop-reset every wake
-        Serial.printf("!! Factory reset triggered (totalResets=%ld) !!\r\n", totalResets);
-        Zigbee.factoryReset(false);
+bool hasJoinedNetwork() {
+    preferences.begin(NVS_NAMESPACE, true);
+    bool joined = preferences.getBool(NVS_KEY_JOINED, false);
+    preferences.end();
+    return joined;
+}
 
-        pinMode(PIN_USER_LED, OUTPUT);
-        for (int i = 0; i < 10; i++) {
-            digitalWrite(PIN_USER_LED, LOW);
-            delay(200);
-            digitalWrite(PIN_USER_LED, HIGH);
-            delay(200);
-        }
-        pinMode(PIN_USER_LED, INPUT);
-    }
+void setJoinedNetwork(bool joined) {
+    if (hasJoinedNetwork() == joined)
+        return;
+
+    preferences.begin(NVS_NAMESPACE, false);
+    preferences.putBool(NVS_KEY_JOINED, joined);
+    preferences.end();
+}
+
+void checkStability() {
+    if (failCount < ZIGBEE_FACTORY_RESET_THRESHOLD)
+        return;
+
+    needFactoryReset = true;
+    setJoinedNetwork(false);
+    totalResets++;
+    failCount = 0; // reset counter so we don't loop-reset every wake
+    LOG("!! Factory reset triggered (totalResets=%ld) !!\r\n", totalResets);
 }
 
 void initializeZigbee() {
@@ -229,13 +268,16 @@ void initializeZigbee() {
     Zigbee.addEndpoint(&zbAnalog);
 
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    uint32_t connectTimeout = (bootCount == 1 || needFactoryReset) ? ZIGBEE_PAIRING_TIMEOUT_MS : ZIGBEE_CONNECT_TIMEOUT_MS;
+    uint32_t connectTimeout = hasJoinedNetwork() ? ZIGBEE_CONNECT_TIMEOUT_MS : ZIGBEE_PAIRING_TIMEOUT_MS;
     zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 3000;
     zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_16384MIN;
     Zigbee.setTimeout(connectTimeout);
 
-    if (!Zigbee.begin(&zigbeeConfig, needFactoryReset)) {
-        Serial.println("Zigbee.begin() failed");
+    bool eraseNetwork = needFactoryReset;
+    needFactoryReset = false;
+
+    if (!Zigbee.begin(&zigbeeConfig, eraseNetwork)) {
+        LOG("Zigbee.begin() failed\r\n");
         failCount++;
         totalFailures++;
         enterDeepSleep();
@@ -245,7 +287,7 @@ void initializeZigbee() {
     unsigned long connectStart = millis();
     while (!Zigbee.connected()) {
         if (millis() - connectStart >= connectTimeout) {
-            Serial.printf("Zigbee connect timeout (%lums)\r\n", (unsigned long)connectTimeout);
+            LOG("Zigbee connect timeout (%lums)\r\n", (unsigned long)connectTimeout);
             failCount++;
             totalFailures++;
             enterDeepSleep();
@@ -253,7 +295,8 @@ void initializeZigbee() {
         }
         delay(20);
     }
-    Serial.printf("Zigbee connected in %lums\r\n", millis() - connectStart);
+    LOG("Zigbee connected in %lums\r\n", millis() - connectStart);
+    setJoinedNetwork(true);
 
     // Push the real attribute values immediately so ZHA's post-join interview
     // reads them instead of the default 0 from addAnalogInput().
@@ -280,17 +323,30 @@ void forceHeartbeat()
     if (heartbeat) batteryPercentage += 1.0f;
 }
 
+bool isUserInitiatedBoot() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:
+        case ESP_RST_EXT:
+        case ESP_RST_USB:
+        case ESP_RST_JTAG:
+            return true;
+        case ESP_RST_UNKNOWN:
+            return bootCount == 1;
+        default:
+            return false;
+    }
+}
+
 void setup() {
     bootCount++;
     cyclesSinceUpdate++;
 
-    Serial.begin(115200);
-    Serial.printf("\r\n=== Boot #%ld (failCount=%d, totalFailures=%ld, totalResets=%ld) ===\r\n",
-                  bootCount, failCount, totalFailures, totalResets);
+    LOG_BEGIN();
+    LOG("\r\n=== Boot #%ld (failCount=%d, totalFailures=%ld, totalResets=%ld) ===\r\n",
+        bootCount, failCount, totalFailures, totalResets);
 
-    // Allow firmware upload on first boot
-    if (bootCount == 1) {
-        delay(10000);
+    if (isUserInitiatedBoot()) {
+        delay(UPLOAD_WINDOW_MS);
     }
 
     analogSetAttenuation(ADC_11db);
@@ -300,29 +356,29 @@ void setup() {
     lightSleepForSensor();
     readMoistureAdc();
 
-    Serial.printf("Moisture: %.2f%% (%.0f mV)\r\n", moisturePercentage, moistureVoltage);
+    LOG("Moisture: %.2f%% (%.0f mV)\r\n", moisturePercentage, moistureVoltage);
 
     if (!shouldSendData()) {
         // Small change -> go back to sleep
-        Serial.println("No significant change, sleeping...");
+        LOG("No significant change, sleeping...\r\n");
         enterDeepSleep();
         return;
     }
     cyclesSinceUpdate = 0;
 
     readBatteryVoltage();
-    Serial.printf("Battery: %.2f%% (%.0f mV)\r\n", batteryPercentage, batteryVoltage);
+    LOG("Battery: %.2f%% (%.0f mV)\r\n", batteryPercentage, batteryVoltage);
 
     checkStability();
-    Serial.println("Connecting to Zigbee...");
+    LOG("Connecting to Zigbee...\r\n");
     initializeZigbee();
 
     forceHeartbeat();
     sendData();
 
-    Serial.printf("Data send %s. Moisture: %.2f%%, Battery: %.2f%%, failCount=%d\r\n",
-                  dataSendSuccessfuly ? "successful" : "failed",
-                  moisturePercentage, batteryPercentage, failCount);
+    LOG("Data send %s. Moisture: %.2f%%, Battery: %.2f%%, failCount=%d\r\n",
+        dataSendSuccessfuly ? "successful" : "failed",
+        moisturePercentage, batteryPercentage, failCount);
     delay(200);
 
     enterDeepSleep();

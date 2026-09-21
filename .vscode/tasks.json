@@ -14,7 +14,7 @@
       "type": "pickString",
       "description": "Select the environment to build and upload",
       "default": "main",
-      "options": ["main", "ZigbeeMicro"]
+      "options": ["main", "main-debug", "ZigbeeMicro"]
     }
   ],
   "tasks": [
