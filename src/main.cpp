@@ -50,8 +50,8 @@ static const float VOLTAGE_DIVIDER_RATIO   = (220000.0f + 220000.0f) / 220000.0f
 static const float BATTERY_CURVE[] = { 3200, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100 };
 
 // Moisture Sensor Calibration (mV)
-static const float MOISTURE_WET_VOLTAGE = 3200.0f;
-static const float MOISTURE_DRY_VOLTAGE = 0.0f;
+static const float MOISTURE_WET_VOLTAGE = 0.0f;
+static const float MOISTURE_DRY_VOLTAGE = 3200.0f;
 
 // Zigbee
 static const int ZIGBEE_ENDPOINT                = 10;
