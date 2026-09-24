@@ -26,8 +26,8 @@
 static const int TIME_TO_SLEEP_MS          = 10 * 60 * 1000; // ms
 static const int FULL_UPDATE_INTERVAL      = 3;
 #else
-static const int TIME_TO_SLEEP_MS          = 10 * 60 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 3;
+static const int TIME_TO_SLEEP_MS          = 30 * 60 * 1000; // ms
+static const int FULL_UPDATE_INTERVAL      = 12;
 #endif
 static const int SENSOR_WARMUP_MS          = 60;            // ms
 static const int REPORT_WAIT_TIMEOUT_MS    = 2000;          // ms
