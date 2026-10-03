@@ -1,328 +1,391 @@
-#include "Zigbee.h"
-#include "ep/ZigbeeAnalog.h"
-#include "Arduino.h"
-#include "esp_system.h"
+// =============================================================================
+// WetOrDead - battery-powered Zigbee soil-moisture sensor (Seeed XIAO ESP32-C6)
+//
+// The device lives in deep sleep and does all of its work in setup():
+//
+//   1. Power the probe, let it settle in light sleep, sample it, power it off.
+//   2. Decide whether a report is due: nothing reported yet, moisture moved by
+//      MOISTURE_REPORT_THRESHOLD since the last acknowledged report, or
+//      HEARTBEAT_CYCLES wakes have passed. If not, go straight back to sleep;
+//      the radio is never started on those wakes.
+//   3. Sample the battery, (re)join the Zigbee network, report moisture and
+//      battery, and wait for the coordinator to acknowledge the reports.
+//   4. Deep-sleep until the next cycle. Consecutive failures back off
+//      exponentially; too many in a row wipe the stored network so the device
+//      pairs from scratch.
+// =============================================================================
+
+#include <Arduino.h>
 #include <Preferences.h>
+#include <Zigbee.h>
+#include <driver/gpio.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cmath>
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-#define DEBUG_MODE false
-
+// Serial logging over USB-CDC. Enabled by the `main-debug` PlatformIO env.
 #ifndef DEBUG_SERIAL
 #define DEBUG_SERIAL false
 #endif
 
-#if DEBUG_SERIAL
-#define LOG_BEGIN()  do { Serial.begin(115200); delay(3000); } while (0)
-#define LOG(...)     Serial.printf(__VA_ARGS__)
-#else
-#define LOG_BEGIN()  ((void)0)
-#define LOG(...)     ((void)0)
+// Bench testing: shorter cycles, and the user LED lights while the probe warms up.
+#ifndef DEBUG_MODE
+#define DEBUG_MODE false
 #endif
 
-#if DEBUG_MODE
-static const int TIME_TO_SLEEP_MS          = 10 * 60 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 3;
-#else
-static const int TIME_TO_SLEEP_MS          = 30 * 60 * 1000; // ms
-static const int FULL_UPDATE_INTERVAL      = 12;
-#endif
-static const int SENSOR_WARMUP_MS          = 60;            // ms
-static const int REPORT_WAIT_TIMEOUT_MS    = 2000;          // ms
-static const int ZIGBEE_CONNECT_TIMEOUT_MS = 5000;          // ms
-static const int ZIGBEE_PAIRING_TIMEOUT_MS = 60000;         // ms
-static const int UPLOAD_WINDOW_MS          = 10000;         // ms
-static const int BACKOFF_MAX_SHIFT         = 6;
-static const long BACKOFF_MAX_SLEEP_MS     = 6L * 3600 * 1000; // ms
-static const float MOISTURE_CHANGE_THRESHOLD = 5.0f; // % change to trigger send
+// --- Wake cycle ---
+constexpr uint32_t CYCLE_MS         = (DEBUG_MODE ? 10 : 30) * 60 * 1000;
+constexpr uint32_t HEARTBEAT_CYCLES = DEBUG_MODE ? 3 : 12;  // report at least this often, even if unchanged
+constexpr uint32_t UPLOAD_WINDOW_MS = 10000;                // stay awake after a manual reset so USB can flash us
+constexpr uint32_t MIN_SLEEP_MS     = 1000;
 
-// Pins
-static const int PIN_BATTERY          =  2; // A2
-static const int PIN_MOISTURE         =  0; // A0
-static const int PIN_MOISTURE_PWR     =  1; // D1
-static const int PIN_USER_LED         = 15; // XIAO ESP32C6 user LED, active-low
+// --- Failure handling ---
+constexpr uint32_t BACKOFF_MAX_SHIFT       = 6;                    // sleep doubles per consecutive failure...
+constexpr uint32_t BACKOFF_MAX_MS          = 6UL * 60 * 60 * 1000; // ...up to this
+constexpr uint32_t NETWORK_RESET_THRESHOLD = 20;                   // consecutive failures before re-pairing
 
-// Battery
-static const int   BATTERY_AVERAGE_SAMPLES = 16;
-static const float VOLTAGE_DIVIDER_RATIO   = (220000.0f + 220000.0f) / 220000.0f;
-static const float BATTERY_CURVE[] = { 3200, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100 };
+// --- Pins (names from the XIAO_ESP32C6 variant) ---
+constexpr uint8_t PIN_PROBE       = A0;
+constexpr uint8_t PIN_PROBE_POWER = D1;
+constexpr uint8_t PIN_BATTERY     = A2;
+constexpr uint8_t PIN_LED         = LED_BUILTIN;  // active-low
 
-// Moisture Sensor Calibration (mV)
-static const float MOISTURE_WET_VOLTAGE = 0.0f;
-static const float MOISTURE_DRY_VOLTAGE = 3200.0f;
+// --- Analog front end ---
+constexpr uint8_t ADC_SAMPLES = 16;  // averaged per reading
 
-// Zigbee
-static const int ZIGBEE_ENDPOINT                = 10;
-static const int ZIGBEE_FACTORY_RESET_THRESHOLD = 20;
-static const char *NVS_NAMESPACE  = "wetordead";
-static const char *NVS_KEY_JOINED = "joined";
+// Soil probe: output voltage at saturation and in dry air, in mV.
+constexpr float    PROBE_WET_MV    = 0.0f;
+constexpr float    PROBE_DRY_MV    = 3200.0f;
+constexpr uint32_t PROBE_WARMUP_MS = 60;
+static_assert(PROBE_DRY_MV != PROBE_WET_MV, "probe calibration points must differ");
 
+// Battery: 220k/220k divider; LiPo discharge curve in mV at 0%, 10%, ..., 100%.
+constexpr float BATTERY_DIVIDER_RATIO = (220000.0f + 220000.0f) / 220000.0f;
+constexpr std::array<float, 11> BATTERY_CURVE_MV = {3200, 3442, 3547, 3673, 3736, 3776, 3812, 3880, 3925, 3953, 4100};
 
-static constexpr int BATTERY_CURVE_SIZE = sizeof(BATTERY_CURVE) / sizeof(BATTERY_CURVE[0]);
+constexpr float MOISTURE_REPORT_THRESHOLD = 5.0f;  // percentage points
 
-// =============================================================================
-// Global State
-// =============================================================================
+// --- Zigbee ---
+constexpr uint8_t  ZIGBEE_ENDPOINT          = 10;
+constexpr int8_t   TX_POWER_DBM             = 20;
+constexpr bool     USE_EXTERNAL_ANTENNA     = true;   // IPEX connector instead of the PCB antenna
+constexpr uint32_t REJOIN_TIMEOUT_MS        = 5000;   // network already stored
+constexpr uint32_t PAIRING_TIMEOUT_MS       = 60000;  // fresh device, searching for a network
+constexpr uint32_t KEEP_ALIVE_MS            = 3000;
+constexpr uint32_t ACK_TIMEOUT_MS           = 2000;
+constexpr uint32_t RADIO_FLUSH_MS           = 200;    // let the stack finish up before power-down
+constexpr float    REPORTING_DELTA          = 0.5f;
+constexpr uint32_t REPORTING_MAX_INTERVAL_S = CYCLE_MS / 1000 * HEARTBEAT_CYCLES;
+static_assert(REPORTING_MAX_INTERVAL_S <= UINT16_MAX, "ZCL reporting interval is 16-bit");
 
-RTC_DATA_ATTR long  bootCount             = 0;
-RTC_DATA_ATTR int   cyclesSinceUpdate     = 0;
-RTC_DATA_ATTR int   failCount             = 0;
-RTC_DATA_ATTR float lastMoisture          = -100.0f;
-RTC_DATA_ATTR bool  heartbeat             = false;
-RTC_DATA_ATTR long  totalFailures         = 0; // diagnostic: cumulative failed cycles
-RTC_DATA_ATTR long  totalResets           = 0; // diagnostic: cumulative factory resets
-RTC_DATA_ATTR bool  needFactoryReset      = false;
+// Remembers across power loss whether we have ever joined, which picks the connect timeout.
+constexpr const char *NVS_NAMESPACE  = "wetordead";
+constexpr const char *NVS_KEY_JOINED = "joined";
 
-ZigbeeAnalog zbAnalog(ZIGBEE_ENDPOINT);
-Preferences preferences;
-
-float moisturePercentage = 0.0f; // %
-float moistureVoltage    = 0.0f; // mV
-float batteryPercentage  = 0.0f; // %
-float batteryVoltage     = 0.0f; // mV
-bool dataSendSuccessfuly = false;
-int dataToSend           = 0;
+// Both branches are always compiled, so debug-only code cannot silently rot.
+#define LOG(...) do { if (DEBUG_SERIAL) Serial.printf(__VA_ARGS__); } while (0)
 
 // =============================================================================
-// Sensor Reading
+// State retained across deep sleep
+//
+// RTC memory survives deep sleep but is re-initialized on every other kind of
+// reset (power-on, reset button, crash), which is exactly the scope we want.
 // =============================================================================
 
-void moistureSensorPowerOn() {
-    pinMode(PIN_MOISTURE_PWR, OUTPUT);
-    digitalWrite(PIN_MOISTURE_PWR, HIGH);
-    gpio_hold_en((gpio_num_t)PIN_MOISTURE_PWR);
-}
+struct RetainedState {
+    uint32_t bootCount;            // wakes since the last cold boot
+    uint32_t cyclesSinceReport;    // wakes since the last acknowledged report
+    uint32_t consecutiveFailures;  // drives back-off and the network reset
+    bool     hasReported;          // lastReportedMoisture is valid
+    float    lastReportedMoisture; // %
+    bool     heartbeatPhase;       // see nudge()
+    uint32_t totalFailures;        // diagnostics only
+    uint32_t totalNetworkResets;   // diagnostics only
+};
 
-void lightSleepForSensor() {
-#if DEBUG_MODE
-    pinMode(PIN_USER_LED, OUTPUT);
-    digitalWrite(PIN_USER_LED, LOW); // active-low: LED on
-    gpio_hold_en((gpio_num_t)PIN_USER_LED);
-#endif
+RTC_DATA_ATTR RetainedState retained = {};
 
-    esp_sleep_enable_timer_wakeup(SENSOR_WARMUP_MS * 1000L);
-    esp_light_sleep_start();
-    LOG_BEGIN(); // reinit after light sleep (APB clock is gated during sleep)
+// =============================================================================
+// Small helpers
+// =============================================================================
 
-#if DEBUG_MODE
-    gpio_hold_dis((gpio_num_t)PIN_USER_LED);
-    digitalWrite(PIN_USER_LED, HIGH); // LED off
-    pinMode(PIN_USER_LED, INPUT);
-#endif
-}
-
-void readMoistureAdc() {
-    moistureVoltage = analogReadMilliVolts(PIN_MOISTURE);
-    moisturePercentage = 100.0f - ((moistureVoltage - MOISTURE_WET_VOLTAGE) / (MOISTURE_DRY_VOLTAGE - MOISTURE_WET_VOLTAGE)) * 100.0f;
-    moisturePercentage = constrain(moisturePercentage, 0.0f, 100.0f);
-
-    gpio_hold_dis((gpio_num_t)PIN_MOISTURE_PWR);
-    digitalWrite(PIN_MOISTURE_PWR, LOW);
-    pinMode(PIN_MOISTURE_PWR, INPUT);
-}
-
-bool shouldSendData() {
-    if (cyclesSinceUpdate >= FULL_UPDATE_INTERVAL)
-        return true;
-
-    return fabs(moisturePercentage - lastMoisture) >= MOISTURE_CHANGE_THRESHOLD;
-}
-
-float voltageToPercent(float voltageMv) {
-    if (voltageMv <= BATTERY_CURVE[0])
-        return 0.0f;
-
-    for (size_t i = 1; i < BATTERY_CURVE_SIZE; i++) {
-        if (voltageMv < BATTERY_CURVE[i]) {
-            float lowerVoltage = BATTERY_CURVE[i - 1];
-            float upperVoltage = BATTERY_CURVE[i];
-            float lowerPercent = (i - 1) * 10.0f;
-            float upperPercent = i * 10.0f;
-            return map(voltageMv, lowerVoltage, upperVoltage, lowerPercent, upperPercent);
-        }
+void beginSerialLog() {
+    if (DEBUG_SERIAL) {
+        Serial.begin(115200);
+        delay(3000);  // give the host time to reattach to USB-CDC
     }
-
-    return 100.0f;
 }
 
-void readBatteryVoltage() {
-    uint32_t voltageSum = 0;
-
-    for (uint8_t i = 0; i < BATTERY_AVERAGE_SAMPLES; i++) {
-        voltageSum += analogReadMilliVolts(PIN_BATTERY);
-    }
-
-    batteryVoltage = (voltageSum / static_cast<float>(BATTERY_AVERAGE_SAMPLES)) * VOLTAGE_DIVIDER_RATIO;
-    batteryPercentage = voltageToPercent(batteryVoltage);
-}
-
-// =============================================================================
-// Data Transmission
-// =============================================================================
-
-void onGlobalResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
-    if (command == ZB_CMD_REPORT_ATTRIBUTE && endpoint == ZIGBEE_ENDPOINT && status == ESP_ZB_ZCL_STATUS_SUCCESS)
-        dataToSend--;
-}
-
-bool responseChecker() {
-    unsigned long startMs = millis();
-    while (dataToSend > 0) {
-        if (millis() - startMs >= REPORT_WAIT_TIMEOUT_MS)
+// Waits for `done` to become true, giving up `timeoutMs` after `startMs`.
+template <typename Predicate>
+bool waitFor(Predicate done, uint32_t startMs, uint32_t timeoutMs) {
+    while (!done()) {
+        if (millis() - startMs >= timeoutMs)
             return false;
         delay(10);
     }
     return true;
 }
 
-void sendData() {
-    zbAnalog.setAnalogInput(moisturePercentage);
-    zbAnalog.setBatteryPercentage((uint8_t)batteryPercentage);
+// Drives a pin and latches it, so the level holds through light sleep.
+void holdPin(uint8_t pin, uint8_t level) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, level);
+    gpio_hold_en(static_cast<gpio_num_t>(pin));
+}
 
-    dataToSend = 0;
-    int attemptedReports = 0;
-    if (zbAnalog.reportBatteryPercentage()) { dataToSend++; attemptedReports++; } // no confirmation for battery percentage
-    if (zbAnalog.reportAnalogInput())       { dataToSend++; attemptedReports++; }
+// Undoes holdPin(): returns to the idle level, then floats the pin.
+void releasePin(uint8_t pin, uint8_t idleLevel) {
+    gpio_hold_dis(static_cast<gpio_num_t>(pin));
+    digitalWrite(pin, idleLevel);
+    pinMode(pin, INPUT);
+}
 
-    dataSendSuccessfuly = (attemptedReports > 0) && responseChecker();
+void lightSleep(uint32_t ms) {
+    esp_sleep_enable_timer_wakeup(uint64_t(ms) * 1000);
+    esp_light_sleep_start();
+    beginSerialLog();  // USB-CDC does not survive light sleep
+}
 
-    if (dataSendSuccessfuly) {
-        lastMoisture = moisturePercentage;
-        failCount = 0;
-    } else {
-        failCount++;
-        totalFailures++;
-    }
+float readMillivolts(uint8_t pin) {
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < ADC_SAMPLES; i++)
+        sum += analogReadMilliVolts(pin);
+    return float(sum) / ADC_SAMPLES;
+}
+
+// Home Assistant only records a new state when the value changes. Offsetting
+// every other report by one step keeps consecutive reports distinct, so each
+// heartbeat stays visible in the history. Steps down when at the top of range.
+float nudge(float value, float step, float max) {
+    if (!retained.heartbeatPhase)
+        return value;
+    return value + step <= max ? value + step : value - step;
 }
 
 // =============================================================================
-// Setup & Main Loop
+// Sensors
 // =============================================================================
 
-long backoffIntervalMs() {
-    if (failCount <= 0)
-        return TIME_TO_SLEEP_MS;
+struct Reading {
+    float millivolts;
+    float percent;
+};
 
-    int shift = failCount < BACKOFF_MAX_SHIFT ? failCount : BACKOFF_MAX_SHIFT;
-    long intervalMs = (long)TIME_TO_SLEEP_MS << shift;
-
-    return intervalMs > BACKOFF_MAX_SLEEP_MS ? BACKOFF_MAX_SLEEP_MS : intervalMs;
+float moisturePercent(float mv) {
+    const float percent = (PROBE_DRY_MV - mv) / (PROBE_DRY_MV - PROBE_WET_MV) * 100.0f;
+    return std::clamp(percent, 0.0f, 100.0f);
 }
 
-void enterDeepSleep() {
-    long elapsedMs = millis();
-    long sleepDurationMs = backoffIntervalMs() - elapsedMs;
+// Piecewise-linear interpolation over BATTERY_CURVE_MV.
+float batteryPercent(float mv) {
+    const auto &curve = BATTERY_CURVE_MV;
+    if (mv <= curve.front())
+        return 0.0f;
+    if (mv >= curve.back())
+        return 100.0f;
 
-    if(sleepDurationMs < 1000L) {
-        sleepDurationMs = 1000L;
-    }
-
-    LOG("Sleeping %lds (failCount=%d)\r\n", sleepDurationMs / 1000L, failCount);
-    esp_sleep_enable_timer_wakeup(sleepDurationMs * 1000L);
-    esp_deep_sleep_start();
+    const float stepPercent = 100.0f / (curve.size() - 1);
+    size_t i = 1;
+    while (mv >= curve[i])
+        i++;
+    const float fraction = (mv - curve[i - 1]) / (curve[i] - curve[i - 1]);
+    return (i - 1 + fraction) * stepPercent;
 }
 
-bool hasJoinedNetwork() {
-    preferences.begin(NVS_NAMESPACE, true);
-    bool joined = preferences.getBool(NVS_KEY_JOINED, false);
-    preferences.end();
+Reading readSoil() {
+    holdPin(PIN_PROBE_POWER, HIGH);
+    if (DEBUG_MODE)
+        holdPin(PIN_LED, LOW);
+
+    lightSleep(PROBE_WARMUP_MS);
+
+    if (DEBUG_MODE)
+        releasePin(PIN_LED, HIGH);
+    const float mv = readMillivolts(PIN_PROBE);
+    releasePin(PIN_PROBE_POWER, LOW);
+
+    return {mv, moisturePercent(mv)};
+}
+
+Reading readBattery() {
+    const float mv = readMillivolts(PIN_BATTERY) * BATTERY_DIVIDER_RATIO;
+    return {mv, batteryPercent(mv)};
+}
+
+// =============================================================================
+// Persistent join flag
+// =============================================================================
+
+bool loadJoinedFlag() {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, /*readOnly=*/true);
+    const bool joined = prefs.getBool(NVS_KEY_JOINED, false);
+    prefs.end();
     return joined;
 }
 
-void setJoinedNetwork(bool joined) {
-    if (hasJoinedNetwork() == joined)
-        return;
-
-    preferences.begin(NVS_NAMESPACE, false);
-    preferences.putBool(NVS_KEY_JOINED, joined);
-    preferences.end();
+void storeJoinedFlag(bool joined) {
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, /*readOnly=*/false);
+    prefs.putBool(NVS_KEY_JOINED, joined);
+    prefs.end();
 }
 
-void checkStability() {
-    if (failCount < ZIGBEE_FACTORY_RESET_THRESHOLD)
-        return;
+// =============================================================================
+// Zigbee
+// =============================================================================
 
-    needFactoryReset = true;
-    setJoinedNetwork(false);
-    totalResets++;
-    failCount = 0; // reset counter so we don't loop-reset every wake
-    LOG("!! Factory reset triggered (totalResets=%ld) !!\r\n", totalResets);
+ZigbeeAnalog sensorEndpoint(ZIGBEE_ENDPOINT);
+
+// Reports still waiting for the coordinator's default response. Written from
+// the Zigbee task, read from ours.
+constexpr uint32_t ACK_MOISTURE = 1 << 0;
+constexpr uint32_t ACK_BATTERY  = 1 << 1;
+std::atomic<uint32_t> pendingAcks{0};
+
+void onDefaultResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
+    if (command != ZB_CMD_REPORT_ATTRIBUTE || endpoint != ZIGBEE_ENDPOINT || status != ESP_ZB_ZCL_STATUS_SUCCESS)
+        return;
+    if (cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT)
+        pendingAcks.fetch_and(~ACK_MOISTURE);
+    else if (cluster == ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG)
+        pendingAcks.fetch_and(~ACK_BATTERY);
 }
 
-void initializeZigbee() {
-    zbAnalog.setManufacturerAndModel("Espressif", "WetOrDead");
-    zbAnalog.addAnalogInput();
-    zbAnalog.setAnalogInputDescription("Humidity");
-    zbAnalog.setAnalogInputApplication(ESP_ZB_ZCL_AI_HUMIDITY_SPACE);
-    zbAnalog.setAnalogInputMinMax(0.0f, 100.0f);
-    zbAnalog.setAnalogInputResolution(0.1f);
-    // setAnalogInputReporting() must be called AFTER Zigbee.begin() + connected,
-    // otherwise the ZCL reporting table write panics with
-    // "ZB OSIF: Zigbee lock is not ready!".
+void configureRadio() {
+    // The board variant already powers the RF switch and selects the PCB antenna.
+    if (USE_EXTERNAL_ANTENNA)
+        digitalWrite(WIFI_ANT_CONFIG, HIGH);
+    esp_zb_set_tx_power(TX_POWER_DBM);
+}
 
-    zbAnalog.setPowerSource(ZB_POWER_SOURCE_BATTERY, (uint8_t)batteryPercentage, (uint8_t)(batteryVoltage / 100.0f));
+void configureEndpoint(const Reading &battery) {
+    sensorEndpoint.setManufacturerAndModel("Espressif", "WetOrDead");
+    sensorEndpoint.addAnalogInput();
+    sensorEndpoint.setAnalogInputDescription("Humidity");
+    sensorEndpoint.setAnalogInputApplication(ESP_ZB_ZCL_AI_HUMIDITY_SPACE);
+    sensorEndpoint.setAnalogInputMinMax(0.0f, 100.0f);
+    sensorEndpoint.setAnalogInputResolution(0.1f);
+    // Battery voltage is not reportable; it is only published here, in 100 mV units.
+    sensorEndpoint.setPowerSource(ZB_POWER_SOURCE_BATTERY, static_cast<uint8_t>(lroundf(battery.percent)),
+                                  static_cast<uint8_t>(lroundf(battery.millivolts / 100.0f)));
 
-    Zigbee.onGlobalDefaultResponse(onGlobalResponse);
-    Zigbee.addEndpoint(&zbAnalog);
+    Zigbee.onGlobalDefaultResponse(onDefaultResponse);
+    Zigbee.addEndpoint(&sensorEndpoint);
+}
 
+bool connect(bool eraseNetwork, bool wasJoined) {
     esp_zb_cfg_t zigbeeConfig = ZIGBEE_DEFAULT_ED_CONFIG();
-    uint32_t connectTimeout = hasJoinedNetwork() ? ZIGBEE_CONNECT_TIMEOUT_MS : ZIGBEE_PAIRING_TIMEOUT_MS;
-    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 3000;
+    zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = KEEP_ALIVE_MS;
+    // Long enough that the parent keeps us through the longest back-off sleep.
     zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_16384MIN;
-    Zigbee.setTimeout(connectTimeout);
 
-    bool eraseNetwork = needFactoryReset;
-    needFactoryReset = false;
+    // begin() blocks until a stored network is rejoined, but returns as soon as
+    // steering starts on a fresh device; connected() is the real signal. Both
+    // waits share one deadline.
+    const uint32_t timeoutMs = wasJoined ? REJOIN_TIMEOUT_MS : PAIRING_TIMEOUT_MS;
+    const uint32_t startMs = millis();
+    Zigbee.setTimeout(timeoutMs);
 
     if (!Zigbee.begin(&zigbeeConfig, eraseNetwork)) {
         LOG("Zigbee.begin() failed\r\n");
-        failCount++;
-        totalFailures++;
-        enterDeepSleep();
-        return;
+        return false;
     }
+    if (!waitFor([] { return Zigbee.connected(); }, startMs, timeoutMs)) {
+        LOG("Zigbee connect timeout (%" PRIu32 " ms)\r\n", timeoutMs);
+        return false;
+    }
+    LOG("Zigbee connected in %" PRIu32 " ms\r\n", millis() - startMs);
+    return true;
+}
 
-    unsigned long connectStart = millis();
-    while (!Zigbee.connected()) {
-        if (millis() - connectStart >= connectTimeout) {
-            LOG("Zigbee connect timeout (%lums)\r\n", (unsigned long)connectTimeout);
-            failCount++;
-            totalFailures++;
-            enterDeepSleep();
-            return;
+// Returns true once the coordinator has acknowledged the moisture report.
+// Battery is best-effort: waited for, but a missing ack is not a failure.
+bool report(float moisture, uint8_t battery) {
+    // Set right after joining, so ZHA's post-join interview reads real values.
+    sensorEndpoint.setAnalogInput(moisture);
+    sensorEndpoint.setBatteryPercentage(battery);
+    // Must run after the stack is up, or the reporting-table write panics
+    // with "ZB OSIF: Zigbee lock is not ready!".
+    sensorEndpoint.setAnalogInputReporting(0, REPORTING_MAX_INTERVAL_S, REPORTING_DELTA);
+
+    // Arm before sending: an ack may arrive before report*() returns.
+    pendingAcks.store(ACK_MOISTURE | ACK_BATTERY);
+    if (!sensorEndpoint.reportAnalogInput())
+        return false;
+    if (!sensorEndpoint.reportBatteryPercentage())
+        pendingAcks.fetch_and(~ACK_BATTERY);
+
+    waitFor([] { return pendingAcks.load() == 0; }, millis(), ACK_TIMEOUT_MS);
+
+    const uint32_t missing = pendingAcks.load();
+    if (missing & ACK_BATTERY)
+        LOG("Battery report not acknowledged\r\n");
+    return !(missing & ACK_MOISTURE);
+}
+
+bool transmit(const Reading &soil, const Reading &battery) {
+    const bool resetNetwork = retained.consecutiveFailures >= NETWORK_RESET_THRESHOLD;
+    bool joined = loadJoinedFlag();
+    if (resetNetwork) {
+        retained.consecutiveFailures = 0;  // one reset per streak, not one per wake
+        retained.totalNetworkResets++;
+        LOG("!! Network reset (totalNetworkResets=%" PRIu32 ") !!\r\n", retained.totalNetworkResets);
+        if (joined) {
+            storeJoinedFlag(false);
+            joined = false;
         }
-        delay(20);
     }
-    LOG("Zigbee connected in %lums\r\n", millis() - connectStart);
-    setJoinedNetwork(true);
 
-    // Push the real attribute values immediately so ZHA's post-join interview
-    // reads them instead of the default 0 from addAnalogInput().
-    zbAnalog.setAnalogInput(moisturePercentage);
-    zbAnalog.setBatteryPercentage((uint8_t)batteryPercentage);
+    configureRadio();
+    configureEndpoint(battery);
+    if (!connect(resetNetwork, joined))
+        return false;
+    if (!joined)
+        storeJoinedFlag(true);
 
-    zbAnalog.setAnalogInputReporting(0, TIME_TO_SLEEP_MS / 1000 * FULL_UPDATE_INTERVAL, 0.5f);
+    const float moisture = nudge(soil.percent, 0.1f, 100.0f);
+    const auto batteryPercent = static_cast<uint8_t>(lroundf(nudge(roundf(battery.percent), 1.0f, 100.0f)));
+    const bool acknowledged = report(moisture, batteryPercent);
+    delay(RADIO_FLUSH_MS);
+    return acknowledged;
 }
 
-void setupAntenna() {
-    esp_zb_set_tx_power(20); // dBm
-    // XIAO ESP32C6 FM8625H RF switch: GPIO14 LOW = internal PCB antenna,
-    // HIGH = external IPEX. Switch to HIGH only if an external antenna is attached.
-    pinMode(3, OUTPUT);
-    digitalWrite(3, LOW);   // Power on the RF switch
-    pinMode(14, OUTPUT);
-    digitalWrite(14, HIGH);  // External antenna
+// =============================================================================
+// Cycle bookkeeping
+// =============================================================================
+
+bool isReportDue(float moisture) {
+    return !retained.hasReported
+        || retained.cyclesSinceReport >= HEARTBEAT_CYCLES
+        || fabsf(moisture - retained.lastReportedMoisture) >= MOISTURE_REPORT_THRESHOLD;
 }
 
-void forceHeartbeat()
-{
-    heartbeat = !heartbeat;
-    if (heartbeat) moisturePercentage += 0.1f;
-    if (heartbeat) batteryPercentage += 1.0f;
+void recordSuccess(float moisture) {
+    retained.hasReported = true;
+    retained.lastReportedMoisture = moisture;
+    retained.cyclesSinceReport = 0;
+    retained.consecutiveFailures = 0;
+    retained.heartbeatPhase = !retained.heartbeatPhase;
 }
 
+// The report stays due, so it is retried on every (backed-off) wake.
+void recordFailure() {
+    retained.consecutiveFailures++;
+    retained.totalFailures++;
+}
+
+// Power-on, reset button, or a fresh flash: someone may want to upload firmware.
 bool isUserInitiatedBoot() {
     switch (esp_reset_reason()) {
         case ESP_RST_POWERON:
@@ -331,59 +394,70 @@ bool isUserInitiatedBoot() {
         case ESP_RST_JTAG:
             return true;
         case ESP_RST_UNKNOWN:
-            return bootCount == 1;
+            return retained.bootCount == 1;
         default:
             return false;
     }
 }
 
+uint32_t cycleIntervalMs() {
+    const uint32_t shift = std::min(retained.consecutiveFailures, BACKOFF_MAX_SHIFT);
+    return std::min<uint64_t>(uint64_t(CYCLE_MS) << shift, BACKOFF_MAX_MS);
+}
+
+// Sleeps so that wakes stay CYCLE_MS apart (more while backing off), regardless
+// of how long this wake took.
+[[noreturn]] void deepSleep() {
+    const uint32_t intervalMs = cycleIntervalMs();
+    const uint32_t awakeMs = millis();
+    const uint32_t sleepMs = intervalMs > awakeMs + MIN_SLEEP_MS ? intervalMs - awakeMs : MIN_SLEEP_MS;
+
+    LOG("Sleeping %" PRIu32 " s (consecutiveFailures=%" PRIu32 ")\r\n", sleepMs / 1000, retained.consecutiveFailures);
+    if (DEBUG_SERIAL)
+        Serial.flush();
+
+    esp_sleep_enable_timer_wakeup(uint64_t(sleepMs) * 1000);
+    esp_deep_sleep_start();
+}
+
+// =============================================================================
+// Entry points
+// =============================================================================
+
 void setup() {
-    bootCount++;
-    cyclesSinceUpdate++;
+    retained.bootCount++;
+    retained.cyclesSinceReport++;
 
-    LOG_BEGIN();
-    LOG("\r\n=== Boot #%ld (failCount=%d, totalFailures=%ld, totalResets=%ld) ===\r\n",
-        bootCount, failCount, totalFailures, totalResets);
+    beginSerialLog();
+    LOG("\r\n=== Boot #%" PRIu32 " (consecutiveFailures=%" PRIu32 ", totalFailures=%" PRIu32 ", totalNetworkResets=%" PRIu32 ") ===\r\n",
+        retained.bootCount, retained.consecutiveFailures, retained.totalFailures, retained.totalNetworkResets);
 
-    if (isUserInitiatedBoot()) {
+    if (isUserInitiatedBoot())
         delay(UPLOAD_WINDOW_MS);
+
+    analogSetAttenuation(ADC_11db);  // full 0-3.1 V input range
+
+    const Reading soil = readSoil();
+    LOG("Moisture: %.2f%% (%.0f mV)\r\n", soil.percent, soil.millivolts);
+
+    if (!isReportDue(soil.percent)) {
+        LOG("No significant change\r\n");
+        deepSleep();
     }
 
-    analogSetAttenuation(ADC_11db);
-    setupAntenna();
+    const Reading battery = readBattery();
+    LOG("Battery: %.2f%% (%.0f mV)\r\n", battery.percent, battery.millivolts);
 
-    moistureSensorPowerOn();
-    lightSleepForSensor();
-    readMoistureAdc();
+    const bool delivered = transmit(soil, battery);
+    if (delivered)
+        recordSuccess(soil.percent);
+    else
+        recordFailure();
 
-    LOG("Moisture: %.2f%% (%.0f mV)\r\n", moisturePercentage, moistureVoltage);
-
-    if (!shouldSendData()) {
-        // Small change -> go back to sleep
-        LOG("No significant change, sleeping...\r\n");
-        enterDeepSleep();
-        return;
-    }
-    cyclesSinceUpdate = 0;
-
-    readBatteryVoltage();
-    LOG("Battery: %.2f%% (%.0f mV)\r\n", batteryPercentage, batteryVoltage);
-
-    checkStability();
-    LOG("Connecting to Zigbee...\r\n");
-    initializeZigbee();
-
-    forceHeartbeat();
-    sendData();
-
-    LOG("Data send %s. Moisture: %.2f%%, Battery: %.2f%%, failCount=%d\r\n",
-        dataSendSuccessfuly ? "successful" : "failed",
-        moisturePercentage, batteryPercentage, failCount);
-    delay(200);
-
-    enterDeepSleep();
+    LOG("Report %s\r\n", delivered ? "acknowledged" : "failed");
+    deepSleep();
 }
 
 void loop() {
-    // Not used - device sleeps after setup
+    deepSleep();  // unreachable: setup() always ends in deep sleep
 }
