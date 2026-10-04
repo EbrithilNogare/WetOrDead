@@ -18,8 +18,9 @@ The device spends almost all of its time in deep sleep. Every wake (30 min by de
 4. **Sleep.** If the report failed, it is retried on every wake, and the sleep interval doubles with each consecutive
    failure (capped at 6 h). After 20 consecutive failures the stored network is wiped and the device pairs again.
 
-Moisture and battery reports alternate by one step (0.1 % / 1 %) from one report to the next. Home Assistant only
-records a value when it changes, so this keeps heartbeats visible.
+Home Assistant only records a value when it changes. So if a reading (moisture rounded to 0.1 %, battery to 1 %) is
+the same as the value sent last time, it is moved by one step before sending. Every report, heartbeats included, then
+shows up as a change.
 
 After a power-on or a press of the reset button, the device stays awake for 10 s so new firmware can be uploaded over
 USB.

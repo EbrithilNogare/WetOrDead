@@ -74,6 +74,10 @@ constexpr std::array<float, 11> BATTERY_CURVE_MV = {3200, 3442, 3547, 3673, 3736
 
 constexpr float MOISTURE_REPORT_THRESHOLD = 5.0f;  // percentage points
 
+// Smallest step of each reported value; also the bump that keeps reports distinct (see distinctFrom()).
+constexpr float MOISTURE_STEP = 0.1f;  // matches the advertised Analog Input resolution
+constexpr float BATTERY_STEP  = 1.0f;
+
 // --- Zigbee ---
 constexpr uint8_t  ZIGBEE_ENDPOINT          = 10;
 constexpr int8_t   TX_POWER_DBM             = 20;
@@ -106,8 +110,9 @@ struct RetainedState {
     uint32_t cyclesSinceReport;    // wakes since the last acknowledged report
     uint32_t consecutiveFailures;  // drives back-off and the network reset
     bool     hasReported;          // lastReportedMoisture is valid
-    float    lastReportedMoisture; // %
-    bool     heartbeatPhase;       // see nudge()
+    float    lastReportedMoisture; // %, as measured
+    float    lastSentMoisture = NAN;  // %, exactly as put on the air (see distinctFrom())
+    float    lastSentBattery  = NAN;  // %
     uint32_t totalFailures;        // diagnostics only
     uint32_t totalNetworkResets;   // diagnostics only
 };
@@ -163,11 +168,16 @@ float readMillivolts(uint8_t pin) {
     return float(sum) / ADC_SAMPLES;
 }
 
-// Home Assistant only records a new state when the value changes. Offsetting
-// every other report by one step keeps consecutive reports distinct, so each
-// heartbeat stays visible in the history. Steps down when at the top of range.
-float nudge(float value, float step, float max) {
-    if (!retained.heartbeatPhase)
+// Rounds to the reporting step, so "same value" means the same value in Home Assistant.
+float quantize(float value, float step) {
+    return roundf(value / step) * step;
+}
+
+// Home Assistant only records a new state when the value changes. If `value`
+// equals what was last sent, move it by one step (down when at the top of the
+// range), so every report - heartbeats included - shows up as a change.
+float distinctFrom(float lastSent, float value, float step, float max) {
+    if (std::isnan(lastSent) || fabsf(value - lastSent) >= step / 2)  // NAN: nothing sent yet
         return value;
     return value + step <= max ? value + step : value - step;
 }
@@ -354,9 +364,12 @@ bool transmit(const Reading &soil, const Reading &battery) {
     if (!joined)
         storeJoinedFlag(true);
 
-    const float moisture = nudge(soil.percent, 0.1f, 100.0f);
-    const auto batteryPercent = static_cast<uint8_t>(lroundf(nudge(roundf(battery.percent), 1.0f, 100.0f)));
-    const bool acknowledged = report(moisture, batteryPercent);
+    const float moisture = distinctFrom(retained.lastSentMoisture, quantize(soil.percent, MOISTURE_STEP), MOISTURE_STEP, 100.0f);
+    const float batteryPercent = distinctFrom(retained.lastSentBattery, quantize(battery.percent, BATTERY_STEP), BATTERY_STEP, 100.0f);
+    const bool acknowledged = report(moisture, static_cast<uint8_t>(lroundf(batteryPercent)));
+    // Remembered even without an ack: the coordinator may have received it anyway.
+    retained.lastSentMoisture = moisture;
+    retained.lastSentBattery = batteryPercent;
     delay(RADIO_FLUSH_MS);
     return acknowledged;
 }
@@ -376,7 +389,6 @@ void recordSuccess(float moisture) {
     retained.lastReportedMoisture = moisture;
     retained.cyclesSinceReport = 0;
     retained.consecutiveFailures = 0;
-    retained.heartbeatPhase = !retained.heartbeatPhase;
 }
 
 // The report stays due, so it is retried on every (backed-off) wake.
