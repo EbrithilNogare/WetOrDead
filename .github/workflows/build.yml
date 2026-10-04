@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [main]
 
     steps:
       - uses: actions/checkout@v4
@@ -18,13 +22,19 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
       - name: Install PlatformIO
         run: |
           python -m pip install --upgrade pip
-          pip install platformio
+          pip install platformio==6.2.0
 
       - name: Create config from example
         run: cp include/secrets.example.h include/secrets.h
 
       - name: Build PlatformIO Project
-        run: pio run --environment main
+        run: pio run --environment ${{ matrix.environment }}

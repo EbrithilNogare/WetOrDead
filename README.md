@@ -19,6 +19,9 @@ The device spends almost all of its time in deep sleep. Every wake (30 min by de
 4. **Sleep.** If the report failed, it is retried on every wake, and the sleep interval doubles with each consecutive
    failure (capped at 6 h). After 20 consecutive failures the stored network is wiped and the device pairs again.
 
+As a safety net, a cycle that is still awake after 3 minutes (e.g. a hung Zigbee stack) is counted as a failure and
+the device deep-sleeps anyway, so a fault can't drain the battery.
+
 The 3 h heartbeat keeps the device well inside ZHA's default 6 h timeout for marking battery devices unavailable.
 
 Home Assistant only records a value when it changes. So if a reading (moisture rounded to 0.1 %, battery to 1 %) is

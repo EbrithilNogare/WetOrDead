@@ -24,6 +24,7 @@
 #include <driver/gpio.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <zcl/esp_zigbee_zcl_power_config.h>
 
 #include <algorithm>
@@ -54,6 +55,8 @@ constexpr uint32_t HEARTBEAT_CYCLES = DEBUG_MODE ? 3 : 6;
 constexpr uint32_t UPLOAD_WINDOW_MS = 10000;  // stay awake after a manual reset so USB can flash us
 constexpr uint32_t MIN_SLEEP_MS     = 1000;
 static_assert(uint64_t(CYCLE_MS) * HEARTBEAT_CYCLES < 6ULL * 60 * 60 * 1000, "heartbeat must beat ZHA's 6 h timeout");
+// Hard cap on one awake cycle; past it we deep-sleep no matter what (see armAwakeGuard()).
+constexpr uint32_t MAX_AWAKE_MS     = 3 * 60 * 1000;
 
 // --- Failure handling ---
 constexpr uint32_t BACKOFF_MAX_SHIFT       = 6;                    // sleep doubles per consecutive failure...
@@ -101,6 +104,9 @@ constexpr uint32_t RADIO_FLUSH_MS           = 200;    // let the stack finish up
 constexpr float    REPORTING_DELTA          = 0.5f;
 constexpr uint32_t REPORTING_MAX_INTERVAL_S = CYCLE_MS / 1000 * HEARTBEAT_CYCLES;
 static_assert(REPORTING_MAX_INTERVAL_S <= UINT16_MAX, "ZCL reporting interval is 16-bit");
+static_assert(UPLOAD_WINDOW_MS + PAIRING_TIMEOUT_MS + INTERVIEW_WINDOW_MS + REPORT_ATTEMPTS * ACK_TIMEOUT_MS + RADIO_FLUSH_MS
+                  + 10000 < MAX_AWAKE_MS,
+              "MAX_AWAKE_MS must leave room for the slowest legitimate cycle");
 
 // Remembers across power loss whether we have ever joined, which picks the connect timeout.
 constexpr const char *NVS_NAMESPACE  = "wetordead";
@@ -485,6 +491,25 @@ uint32_t cycleIntervalMs() {
     return std::min<uint64_t>(uint64_t(CYCLE_MS) << shift, BACKOFF_MAX_MS);
 }
 
+// Battery-life safety net: if anything hangs (e.g. inside the Zigbee stack),
+// count the cycle as failed and deep-sleep anyway. Production only, since
+// DEBUG_SERIAL builds never sleep.
+void armAwakeGuard() {
+    if (DEBUG_SERIAL)
+        return;
+    const esp_timer_create_args_t args = {
+        .callback = [](void *) {
+            recordFailure();
+            esp_sleep_enable_timer_wakeup(uint64_t(cycleIntervalMs()) * 1000);
+            esp_deep_sleep_start();
+        },
+        .name = "awake_guard",
+    };
+    esp_timer_handle_t timer;
+    if (esp_timer_create(&args, &timer) == ESP_OK)
+        esp_timer_start_once(timer, uint64_t(MAX_AWAKE_MS) * 1000);
+}
+
 // One measure/report cycle. `firstSinceBoot` is always true in production,
 // where every cycle starts from deep sleep.
 void runCycle(bool firstSinceBoot) {
@@ -537,6 +562,7 @@ void sleepRestOfCycle(uint32_t cycleStartMs) {
 // =============================================================================
 
 void setup() {
+    armAwakeGuard();
     beginSerialLog();
     analogSetAttenuation(ADC_11db);  // full 0-3.1 V input range
 
