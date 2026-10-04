@@ -287,6 +287,10 @@ void storeJoinedFlag(bool joined) {
 
 ZigbeeAnalog sensorEndpoint(ZIGBEE_ENDPOINT);
 
+// Set once Zigbee.begin() has been called; it must not be called twice per boot.
+// (Tracked here because ZigbeeCore::initialized() only exists in newer cores.)
+bool zigbeeBegun = false;
+
 // Reports still waiting for the coordinator's default response. Written from
 // the Zigbee task, read from ours.
 constexpr uint32_t ACK_MOISTURE = 1 << 0;
@@ -328,7 +332,8 @@ bool connect(const Reading &battery, bool eraseNetwork, bool wasJoined) {
     const uint32_t timeoutMs = wasJoined ? REJOIN_TIMEOUT_MS : PAIRING_TIMEOUT_MS;
     const uint32_t startMs = millis();
 
-    if (!Zigbee.initialized()) {
+    if (!zigbeeBegun) {
+        zigbeeBegun = true;
         configureRadio();
         configureEndpoint(battery);
 
@@ -421,7 +426,7 @@ bool transmit(const Reading &soil, const Reading &battery, bool firstSinceBoot) 
             storeJoinedFlag(false);
             joined = false;
         }
-        if (Zigbee.initialized())
+        if (zigbeeBegun)
             Zigbee.factoryReset();  // only in DEBUG_SERIAL builds; erases and restarts
     }
 
